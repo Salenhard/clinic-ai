@@ -1,0 +1,35 @@
+services:
+
+  clinical-graph-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: clinical-graph-builder:latest
+    container_name: clinical-graph-builder
+
+    environment:
+      # Pass your API key via .env file or shell export
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+
+    volumes:
+      # Put input PDF files in ./data/input/
+      - ./data/input:/data/input:ro
+      # Graph JSON and metrics will appear in ./data/output/
+      - ./data/output:/data/output
+      # Pipeline cache persists between runs (useful with --use-cache)
+      - ./data/cache:/app/pipeline_cache
+
+    # Override these args at runtime:
+    #   docker compose run clinical-graph-builder \
+    #       --input /data/input/guidelines.pdf \
+    #       --output /data/output/graph.json \
+    #       --section "переломы шейки бедра"
+    command: >
+      --input  /data/input/${INPUT_FILE:-guidelines.pdf}
+      --output /data/output/${OUTPUT_FILE:-graph.json}
+      --metrics /data/output/${METRICS_FILE:-metrics.json}
+      --model  ${MODEL:-claude-sonnet-4-20250514}
+      ${SECTION:+--section "${SECTION}"}
+      ${VERBOSE:+--verbose}
+      ${USE_CACHE:+--use-cache}

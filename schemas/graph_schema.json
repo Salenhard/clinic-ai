@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ClinicalGraph",
+  "type": "object",
+  "required": ["metadata", "graph"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["source_document", "created_at", "version", "topic"],
+      "properties": {
+        "source_document": { "type": "string" },
+        "created_at": { "type": "string" },
+        "version": { "type": "string" },
+        "topic": { "type": "string" }
+      }
+    },
+    "graph": {
+      "type": "object",
+      "required": ["nodes", "edges"],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "type", "label"],
+            "properties": {
+              "id": { "type": "string" },
+              "type": { "type": "string", "enum": ["START", "DECISION", "ACTION", "WARNING", "END"] },
+              "label": { "type": "string" },
+              "question": { "type": "string" },
+              "options": { "type": "array", "items": { "type": "string" } },
+              "action_details": {
+                "type": "object",
+                "properties": {
+                  "procedure": { "type": "string" },
+                  "implant": { "type": "string" },
+                  "timing": { "type": "string" },
+                  "evidence_level": { "type": "string" },
+                  "contraindications": { "type": "array", "items": { "type": "string" } },
+                  "notes": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "from", "to", "label"],
+            "properties": {
+              "id": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "label": { "type": "string" },
+              "condition": {
+                "type": "object",
+                "properties": {
+                  "field": { "type": "string" },
+                  "operator": { "type": "string" },
+                  "value": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
