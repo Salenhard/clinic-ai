@@ -6,6 +6,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from google.genai import types as genai_types
+
 from .rate_limiter import get_limiter
 
 logger = logging.getLogger(__name__)
@@ -22,16 +24,15 @@ class RateLimitError(PipelineError):
 class BasePipelineStage(ABC):
     stage_name: str = "base"
     MAX_RETRIES = 3
-    RETRY_DELAY = 2  # seconds — for non-rate-limit errors
+    RETRY_DELAY = 2  # seconds
 
-    # On 429, back off longer and don't count against MAX_RETRIES
-    RATE_LIMIT_BACKOFF = 65  # slightly over 1-minute window
+    RATE_LIMIT_BACKOFF = 65  # seconds — slightly over 1-minute window
 
     def __init__(
         self,
-        client,
-        model: str = "claude-sonnet-4-20250514",
-        requests_per_minute: int = 5,
+        client,            # google.genai.Client instance
+        model: str = "gemini-2.0-flash",
+        requests_per_minute: int = 15,
     ):
         self.client = client
         self.model = model
@@ -62,43 +63,51 @@ class BasePipelineStage(ABC):
             return text[start:end + 1]
         return text[start:max(end, end_arr) + 1]
 
-    # ── LLM call with rate limiting ───────────────────────────────────────────
+    # ── LLM call ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str, system: Optional[str] = None) -> str:
         """
-        Make a single LLM call.
+        Make a single call via google-genai SDK (google.genai.Client).
         - Acquires a rate-limit slot BEFORE the request.
-        - On HTTP 429 waits RATE_LIMIT_BACKOFF seconds and retries once.
+        - On 429 / ResourceExhausted backs off RATE_LIMIT_BACKOFF seconds.
         """
         self._limiter.acquire()
 
-        messages = [{"role": "user", "content": prompt}]
-        kwargs = {
-            "model": self.model,
-            "max_tokens": 8000,
-            "messages": messages,
-        }
-        if system:
-            kwargs["system"] = system
+        config = genai_types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=8192,
+            system_instruction=system if system else None,
+        )
 
         try:
-            response = self.client.messages.create(**kwargs)
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config,
+            )
         except Exception as exc:
             exc_str = str(exc).lower()
-            if "429" in exc_str or "rate_limit" in exc_str or "overloaded" in exc_str:
+            if "429" in exc_str or "resource_exhausted" in exc_str or "quota" in exc_str:
                 logger.warning(
-                    f"{self.stage_name}: 429 / overloaded — "
-                    f"backing off {self.RATE_LIMIT_BACKOFF}s …"
+                    f"{self.stage_name}: quota exceeded — "
+                    f"backing off {self.RATE_LIMIT_BACKOFF}s ..."
                 )
                 time.sleep(self.RATE_LIMIT_BACKOFF)
-                # Retry once after back-off (limiter already satisfied above)
-                response = self.client.messages.create(**kwargs)
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config,
+                )
             else:
                 raise
 
-        usage = response.usage
-        self.tokens_used += usage.input_tokens + usage.output_tokens
-        return response.content[0].text
+        # Track token usage
+        meta = getattr(response, "usage_metadata", None)
+        if meta:
+            self.tokens_used += getattr(meta, "prompt_token_count", 0)
+            self.tokens_used += getattr(meta, "candidates_token_count", 0)
+
+        return response.text
 
     # ── JSON repair ───────────────────────────────────────────────────────────
 
@@ -133,7 +142,7 @@ class BasePipelineStage(ABC):
             except json.JSONDecodeError as e:
                 logger.warning(
                     f"{self.stage_name} attempt {attempt}/{self.MAX_RETRIES}: "
-                    f"JSON parse error — {e}"
+                    f"JSON parse error -- {e}"
                 )
                 last_error = e
                 if attempt == self.MAX_RETRIES:
@@ -157,7 +166,7 @@ class BasePipelineStage(ABC):
 
             if attempt < self.MAX_RETRIES:
                 delay = self.RETRY_DELAY * attempt
-                logger.info(f"{self.stage_name}: retrying in {delay}s …")
+                logger.info(f"{self.stage_name}: retrying in {delay}s ...")
                 time.sleep(delay)
 
         raise PipelineError(
