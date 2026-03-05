@@ -1,4 +1,4 @@
-from .base import PipelineError, RateLimitError, BasePipelineStage
+from .base import PipelineError, BasePipelineStage
 from .stage1_entities import Stage1Entities
 from .stage2_rules import Stage2Rules
 from .stage3_nodes import Stage3Nodes

@@ -31,6 +31,7 @@ from pipeline import (
     Stage6Verify,
     configure_limiter,
 )
+from pipeline.chunker import TextChunker, chunk_summary
 from metrics import compute_graph_metrics
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
@@ -266,6 +267,8 @@ def run_pipeline(
     verbose: bool,
     use_cache: bool,
     requests_per_minute: int = 15,
+    chunk_size: int = 3_000,
+    overlap: int = 1000,
 ) -> None:
     logger = logging.getLogger(__name__)
     start_time = time.time()
@@ -306,6 +309,11 @@ def run_pipeline(
     text = filter_section(full_text, section)
     logger.info(f"Text length: {len(text)} chars")
 
+    # ── Chunk the text ────────────────────────────────────────────────────────
+    chunker = TextChunker(max_chars=chunk_size, overlap_chars=overlap)
+    chunks = chunker.split(text)
+    logger.info(f"Text split: {chunk_summary(chunks)}")
+
     # ── Stage 1: Entities ─────────────────────────────────────────────────────
     logger.info("Stage 1: Entity extraction")
     entities = load_cache("stage1_entities") if use_cache else None
@@ -313,7 +321,7 @@ def run_pipeline(
         logger.info("  (loaded from cache)")
     else:
         try:
-            entities = stages["stage1"].run(text, section)
+            entities = stages["stage1"].run(chunks, section)
             save_cache("stage1_entities", entities)
             stages_completed += 1
         except PipelineError as e:
@@ -328,7 +336,7 @@ def run_pipeline(
         logger.info("  (loaded from cache)")
     else:
         try:
-            rules = stages["stage2"].run(text, entities)
+            rules = stages["stage2"].run(chunks, entities)
             save_cache("stage2_rules", rules)
             stages_completed += 1
         except PipelineError as e:
@@ -445,13 +453,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Models:
-  gemini-2.0-flash        fast, free tier: 15 RPM  (default)
-  gemini-2.0-flash-lite   fastest, free tier: 30 RPM
-  gemini-1.5-pro          most capable, free tier: 2 RPM
+  gemini-3.1-flash-lite-preview        fast, free tier: 15 RPM  (default)
 
 Examples:
   python main.py --input guidelines.pdf --section "переломы шейки бедра"
-  python main.py --input guidelines.pdf --model gemini-2.0-flash-lite --rpm 30
+  python main.py --input guidelines.pdf --model gemini-3.1-flash-lite-preview --rpm 15
   python main.py --input guidelines.pdf --use-cache --verbose
         """,
     )
@@ -461,8 +467,8 @@ Examples:
     parser.add_argument("--section", "-s", default=None, help="Focus on this document section")
     parser.add_argument(
         "--model",
-        default="gemini-2.0-flash",
-        help="Gemini model name (default: gemini-2.0-flash)",
+        default="gemini-3.1-flash-lite-preview",
+        help="Gemini model name (default: gemini-3.1-flash-lite-preview)",
     )
     parser.add_argument(
         "--rpm",
@@ -470,6 +476,20 @@ Examples:
         default=15,
         metavar="N",
         help="Max requests per minute (default: 15 for free tier)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=6_000,
+        metavar="N",
+        help="Max chars per text chunk sent to LLM",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Overlap chars between consecutive chunks (default: 400)",
     )
     parser.add_argument("--verbose",   "-v", action="store_true", help="Verbose logging")
     parser.add_argument("--use-cache",       action="store_true", help="Load cached pipeline stages")
@@ -494,6 +514,8 @@ def main() -> None:
             verbose=args.verbose,
             use_cache=args.use_cache,
             requests_per_minute=args.rpm,
+            chunk_size=args.chunk_size,
+            overlap=args.overlap,
         )
     except Exception as e:
         logging.getLogger(__name__).error(f"Pipeline failed: {e}", exc_info=True)
