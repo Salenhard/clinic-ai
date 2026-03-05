@@ -30,6 +30,7 @@ services:
       --output /data/output/${OUTPUT_FILE:-graph.json}
       --metrics /data/output/${METRICS_FILE:-metrics.json}
       --model  ${MODEL:-claude-sonnet-4-20250514}
+      --rpm    ${RPM:-5}
       ${SECTION:+--section "${SECTION}"}
       ${VERBOSE:+--verbose}
       ${USE_CACHE:+--use-cache}
