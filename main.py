@@ -30,6 +30,7 @@ from pipeline import (
     Stage5Assembly,
     Stage6Verify,
     Stage7Fix,
+    validate,
     configure_limiter,
 )
 from pipeline.chunker import TextChunker, chunk_summary
@@ -269,7 +270,7 @@ def run_pipeline(
     use_cache: bool,
     requests_per_minute: int = 15,
     chunk_size: int = 25_000,
-    overlap: int = 4000,
+    overlap: int = 400,
 ) -> None:
     logger = logging.getLogger(__name__)
     start_time = time.time()
@@ -399,6 +400,7 @@ def run_pipeline(
         topic=section or "clinical guidelines",
     )
 
+
     # ── Schema validation ─────────────────────────────────────────────────────
     for err in validate_graph(final_graph)[:5]:
         logger.warning(f"Schema: {err}")
@@ -413,6 +415,7 @@ def run_pipeline(
         logger.error(f"Stage 6 failed: {e}")
         failed_stages.append("stage6")
 
+
     # ── Stage 7: Graph repair ─────────────────────────────────────────────────
     logger.info("Stage 7: Graph repair based on verification report")
     fixed_cache = load_cache("stage7_fix") if use_cache else None
@@ -424,6 +427,11 @@ def run_pipeline(
             final_graph = stages["stage7"].run(final_graph, verification_result, text)
             save_cache("stage7_fix", final_graph)
             stages_completed += 1
+            changelog = final_graph.get("changelog", [])
+            if changelog:
+                logger.info(f"  Changelog: {len(changelog)} changes applied")
+            else:
+                logger.info("  No changes needed — graph returned unchanged")
         except PipelineError as e:
             logger.error(f"Stage 7 failed: {e}")
             failed_stages.append("stage7")
@@ -446,6 +454,8 @@ def run_pipeline(
         metrics["clinical_accuracy_score"] = verification_result.get("clinical_accuracy_score")
         metrics["clinical_issues"] = verification_result.get("issues", [])
         metrics["missing_scenarios"] = verification_result.get("missing_scenarios", [])
+    metrics["changelog"] = final_graph.get("changelog", [])
+    metrics["changelog_count"] = len(final_graph.get("changelog", []))
     metrics["elapsed_seconds"] = round(time.time() - start_time, 1)
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -455,6 +465,21 @@ def run_pipeline(
     Path(metrics_path).write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # ── Final structural validation ──────────────────────────────────────────
+    final_structural_issues = validate(final_graph)
+    metrics["final_structural_issues"] = final_structural_issues
+    metrics["final_structural_critical"] = sum(
+        1 for i in final_structural_issues if i["severity"] == "critical"
+    )
+    metrics["final_structural_warnings"] = sum(
+        1 for i in final_structural_issues if i["severity"] == "warning"
+    )
+    if final_structural_issues:
+        for iss in final_structural_issues:
+            logger.warning(f"Final validation [{iss['severity'].upper()}]: {iss['description']}")
+    else:
+        logger.info("Final validation: graph is structurally valid")
 
     # ── Report ────────────────────────────────────────────────────────────────
     source_name = Path(input_pdf).name
@@ -470,8 +495,6 @@ def parse_args() -> argparse.Namespace:
         description="Extract clinical decision graphs from PDF guidelines (google-genai / Gemini)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Models:
-  gemini-3.1-flash-lite-preview        fast, free tier: 15 RPM  (default)
 
 Examples:
   python main.py --input guidelines.pdf --section "переломы шейки бедра"
@@ -486,7 +509,7 @@ Examples:
     parser.add_argument(
         "--model",
         default="gemini-3.1-flash-lite-preview",
-        help="Gemini model name (default: gemini-3.1-flash-lite-preview)",
+        help="Gemini model name (default: gemini-3.1-flash-preview)",
     )
     parser.add_argument(
         "--rpm",
@@ -500,7 +523,7 @@ Examples:
         type=int,
         default=25_000,
         metavar="N",
-        help="Max chars per text chunk sent to LLM",
+        help="Max chars per text chunk sent to LLM (default: 12000 ≈ 3000 tokens)",
     )
     parser.add_argument(
         "--overlap",

@@ -1,25 +1,34 @@
 """
-Stage 7: Graph repair based on Stage 6 verification report.
+Stage 7: Graph repair — validate → fix loop.
+
+Flow:
+  1. Run structural validator  →  list of issues
+  2. Combine with Stage 6 clinical issues
+  3. Send to LLM with explicit fix instructions
+  4. Run deterministic _post_process on LLM response
+  5. Re-validate; if critical issues remain and attempts left → repeat (max 2 loops)
 
 Output schema is IDENTICAL to Stage 5:
-  {
-    "metadata": { ... },
-    "graph": { "nodes": [...], "edges": [...] }
-  }
-
-"changelog" is attached at the top level for metrics only.
+  { "metadata": {...}, "graph": { "nodes": [...], "edges": [...] } }
+"changelog" is attached at top level for metrics only.
 """
 import json
 import logging
 from copy import deepcopy
+from typing import Optional
 
 from .base import BasePipelineStage, PipelineError
+from .graph_validator import validate
 
 logger = logging.getLogger(__name__)
 
+MAX_FIX_LOOPS = 2   # max LLM repair attempts
+
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
 _PROMPT_TEMPLATE = """\
-Ты — эксперт по клиническим алгоритмам. Исправь граф принятия клинических \
-решений на основе результатов экспертной проверки.
+Ты — эксперт по клиническим алгоритмам. Исправь граф принятия решений.
 
 ═══════════════════════════════════════════
 ТЕКУЩИЙ ГРАФ:
@@ -31,15 +40,9 @@ _PROMPT_TEMPLATE = """\
 {edges_json}
 
 ═══════════════════════════════════════════
-КЛИНИЧЕСКИЕ ПРОБЛЕМЫ (Stage 6):
+ПРОБЛЕМЫ, КОТОРЫЕ НУЖНО ИСПРАВИТЬ:
 ═══════════════════════════════════════════
-Оценка точности: {accuracy_score}
-
-Проблемы для исправления:
-{issues_text}
-
-Непокрытые сценарии для добавления:
-{missing_text}
+{all_issues_text}
 
 ═══════════════════════════════════════════
 ИСХОДНЫЙ ТЕКСТ (справочно):
@@ -47,273 +50,306 @@ _PROMPT_TEMPLATE = """\
 {source_text}
 
 ═══════════════════════════════════════════
-ОБЯЗАТЕЛЬНЫЕ СТРУКТУРНЫЕ ПРАВИЛА:
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ГРАФА:
 ═══════════════════════════════════════════
-
 УЗЛЫ:
-1. START — ровно один, question=null, options=[], action_details=null
-2. DECISION — имеет question и options; action_details=null
-3. ACTION — question=null, options=[], action_details обязателен
-4. WARNING — question=null, options=[], может иметь action_details или null
-5. END — question=null, options=[], action_details=null; может быть несколько
+• START: ровно один; question=null, options=[], action_details=null
+• DECISION: имеет question + минимум 2 options; action_details=null
+• ACTION: question=null, options=[]; action_details обязателен
+• WARNING: question=null, options=[]
+• END: question=null, options=[], action_details=null; может быть несколько
 
 РЁБРА:
-6. START → первый DECISION (одно ребро, condition=null)
-7. Каждый вариант из DECISION.options → ровно одно исходящее ребро
-8. После каждого ACTION → ребро к END (condition=null)
-9. После каждого WARNING → ребро к END (condition=null)
-10. Нет дублирующих рёбер (одинаковые from+to)
-11. Нет самопетель (from == to)
-12. Нет циклов
-13. Все узлы достижимы из START
-14. Условия рёбер из одного DECISION-узла взаимоисключающие
+• START → первый DECISION (одно безусловное ребро)
+• Каждый вариант из DECISION.options → ровно одно исходящее ребро
+  (метка ребра или condition.value должны точно соответствовать варианту)
+• После каждого ACTION → ребро к END (condition=null)
+• После каждого WARNING → ребро к END (condition=null)
+• WARNING-узел должен идти ДО ACTION, а не после:
+  ПРАВИЛЬНО: DECISION → WARNING → ACTION → END
+  НЕПРАВИЛЬНО: DECISION → ACTION → WARNING → END
+• Нет дублирующих рёбер (одинаковые from+to)
+• Нет самопетель
+• Нет циклов
+• Все узлы достижимы из START
 
-ИСПРАВЛЕНИЯ:
-- Исправь все clinical проблемы из отчёта Stage 6
-- Добавь недостающие сценарии (важность high/medium)
-- Сохрани id существующих узлов/рёбер
-- Новые узлы: node_fix_001, node_fix_002, ...
-- Новые рёбра: edge_fix_001, edge_fix_002, ...
+УСЛОВИЯ (condition):
+• Если DECISION ветвится по двум параметрам (например, тип перелома И возраст),
+  используй вложенные DECISION-узлы — не пытайся объединить два условия в одном ребре
+• НЕ добавляй ребро с условием по полю F из узла N, если поле F уже было
+  определено на пути к узлу N (противоречивое условие)
+• НЕЛЬЗЯ направлять две разные ветки возраста в один и тот же DECISION-узел
+  типа перелома — создай отдельный узел для каждой возрастной группы
+• Условия рёбер из одного DECISION взаимоисключающие
 
-Верни СТРОГО JSON — только nodes, edges, changelog (без metadata):
+Сохрани id существующих узлов/рёбер без изменений.
+Новые узлы: node_fix_001, node_fix_002, ...  
+Новые рёбра: edge_fix_001, edge_fix_002, ...
+
+Верни СТРОГО JSON (только nodes + edges + changelog, без metadata):
 {{
   "nodes": [
     {{
-      "id": "node_001",
-      "type": "START | DECISION | ACTION | WARNING | END",
+      "id": "...",
+      "type": "START|DECISION|ACTION|WARNING|END",
       "label": "...",
-      "question": "текст вопроса или null",
-      "options": ["вариант А", "вариант Б"],
+      "question": "текст или null",
+      "options": [],
       "action_details": {{
-        "procedure": "...",
-        "implant": "...",
-        "timing": "...",
-        "evidence_level": "...",
-        "contraindications": [],
-        "notes": "..."
+        "procedure": "...", "implant": "...", "timing": "...",
+        "evidence_level": "...", "contraindications": [], "notes": "..."
       }}
     }}
   ],
   "edges": [
     {{
-      "id": "edge_001",
-      "from": "node_001",
-      "to": "node_002",
-      "label": "текст условия",
-      "condition": {{
-        "field": "fracture_type",
-        "operator": "==",
-        "value": "Garden I-II"
-      }}
+      "id": "...", "from": "...", "to": "...",
+      "label": "...",
+      "condition": {{"field": "...", "operator": "...", "value": "..."}}
     }}
   ],
   "changelog": [
-    {{
-      "action": "modified | added | removed",
-      "element": "node | edge",
-      "id": "...",
-      "reason": "краткое объяснение"
-    }}
+    {{"action": "modified|added|removed", "element": "node|edge",
+      "id": "...", "reason": "..."}}
   ]
 }}
 """
 
 
-def _format_issues(issues: list) -> str:
-    actionable = [i for i in issues if i.get("severity") in ("critical", "warning")]
-    if not actionable:
-        return "  (нет критических или важных проблем)"
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_all_issues(structural: list[dict], clinical: list[dict]) -> str:
     lines = []
-    for i, iss in enumerate(actionable, 1):
-        sev = iss.get("severity", "").upper()
-        node = f" [узел: {iss['node_id']}]" if iss.get("node_id") else ""
-        lines.append(
-            f"  {i}. [{sev}]{node} {iss.get('description', '')}\n"
-            f"     → {iss.get('suggestion', 'не указано')}"
-        )
-    return "\n".join(lines)
+    if structural:
+        lines.append("СТРУКТУРНЫЕ проблемы:")
+        for i, iss in enumerate(structural, 1):
+            nid = f" [узел: {iss['node_id']}]" if iss.get("node_id") else ""
+            lines.append(f"  {i}. [{iss['severity'].upper()}]{nid} {iss['description']}")
+            lines.append(f"     → {iss['suggestion']}")
+    else:
+        lines.append("Структурных проблем нет.")
+
+    actionable_clinical = [
+        c for c in clinical if c.get("severity") in ("critical", "warning")
+    ]
+    if actionable_clinical:
+        lines.append("\nКЛИНИЧЕСКИЕ проблемы (из Stage 6):")
+        for i, iss in enumerate(actionable_clinical, 1):
+            nid = f" [узел: {iss.get('node_id')}]" if iss.get("node_id") else ""
+            lines.append(f"  {i}. [{iss['severity'].upper()}]{nid} {iss['description']}")
+            lines.append(f"     → {iss.get('suggestion', 'не указано')}")
+
+    missing = [c for c in clinical if c.get("importance") in ("high", "medium")]
+    if missing:
+        lines.append("\nНЕПОКРЫТЫЕ СЦЕНАРИИ (добавить):")
+        for i, ms in enumerate(missing, 1):
+            lines.append(f"  {i}. [{ms.get('importance','').upper()}] {ms.get('description','')}")
+
+    return "\n".join(lines) if lines else "Проблем не выявлено."
 
 
-def _format_missing(scenarios: list) -> str:
-    important = [m for m in scenarios if m.get("importance") in ("high", "medium")]
-    if not important:
-        return "  (все важные сценарии покрыты)"
-    lines = []
-    for i, ms in enumerate(important, 1):
-        imp = ms.get("importance", "").upper()
-        lines.append(f"  {i}. [{imp}] {ms.get('description', '')}")
-    return "\n".join(lines)
-
-
-def _post_process(data: dict) -> dict:
+def _post_process(data: dict, node_type: dict) -> dict:
     """
-    Lightweight deterministic fixes applied AFTER LLM response
-    to catch common structural violations.
+    Deterministic fixes applied after every LLM response.
+    - Remove duplicate edges
+    - Remove self-loops
+    - Ensure every ACTION/WARNING has edge to END
+    - Ensure START has no question/options
     """
-    nodes = data.get("nodes", [])
-    edges = data.get("edges", [])
+    nodes: list = data.get("nodes", [])
+    edges: list = data.get("edges", [])
 
-    node_map = {n["id"]: n for n in nodes}
-    node_types = {n["id"]: n.get("type") for n in nodes}
+    # Rebuild node_type map from current nodes
+    nt = {n["id"]: n.get("type", "") for n in nodes}
 
-    # ── Fix 1: START must not have question/options ───────────────────────────
-    for node in nodes:
-        if node.get("type") == "START":
-            node["question"] = None
-            node["options"] = []
-            node["action_details"] = None
+    # Fix START fields
+    for n in nodes:
+        if n.get("type") == "START":
+            n["question"] = None
+            n["options"] = []
+            n["action_details"] = None
 
-    # ── Fix 2: Remove duplicate edges (same from+to) ──────────────────────────
-    seen_pairs: set[tuple] = set()
+    # Remove duplicate/self-loop edges
+    seen: set[tuple] = set()
     clean_edges = []
-    for edge in edges:
-        pair = (edge.get("from"), edge.get("to"))
+    for e in edges:
+        pair = (e.get("from"), e.get("to"))
         if pair[0] == pair[1]:
-            logger.warning(f"Stage7 post-process: self-loop edge {edge.get('id')} removed")
+            logger.debug(f"post_process: self-loop {e.get('id')} removed")
             continue
-        if pair in seen_pairs:
-            logger.warning(f"Stage7 post-process: duplicate edge {pair} removed")
+        if pair in seen:
+            logger.debug(f"post_process: duplicate edge {pair} removed")
             continue
-        seen_pairs.add(pair)
-        clean_edges.append(edge)
+        seen.add(pair)
+        clean_edges.append(e)
     data["edges"] = clean_edges
-    edges = clean_edges
 
-    # ── Fix 3: Ensure every ACTION/WARNING has an edge to an END node ─────────
+    # Ensure END node exists
     end_nodes = [n["id"] for n in nodes if n.get("type") == "END"]
     if not end_nodes:
-        # Create a global END node if none exists
         end_id = "node_end"
         nodes.append({
-            "id": end_id,
-            "type": "END",
-            "label": "Завершение",
-            "question": None,
-            "options": [],
-            "action_details": None,
+            "id": end_id, "type": "END", "label": "Завершение",
+            "question": None, "options": [], "action_details": None,
         })
-        node_types[end_id] = "END"
+        nt[end_id] = "END"
         end_nodes = [end_id]
-        logger.warning("Stage7 post-process: no END node found, created node_end")
+        logger.warning("post_process: no END node — created node_end")
 
     global_end = end_nodes[0]
-    sources_to_end = {e["from"] for e in edges if node_types.get(e["to"]) == "END"}
+    sources_to_end = {e["from"] for e in data["edges"] if nt.get(e.get("to")) == "END"}
 
-    fix_edge_counter = 1
-    for node in nodes:
-        nid = node["id"]
-        ntype = node.get("type")
+    counter = sum(
+        1 for e in data["edges"] if e.get("id", "").startswith("edge_post_fix_")
+    ) + 1
+
+    for n in nodes:
+        nid, ntype = n["id"], n.get("type")
         if ntype in ("ACTION", "WARNING") and nid not in sources_to_end:
-            new_edge_id = f"edge_post_fix_{fix_edge_counter:03d}"
-            fix_edge_counter += 1
+            new_id = f"edge_post_fix_{counter:03d}"
+            counter += 1
             data["edges"].append({
-                "id": new_edge_id,
-                "from": nid,
-                "to": global_end,
-                "label": "Завершение ветки",
-                "condition": None,
+                "id": new_id, "from": nid, "to": global_end,
+                "label": "Завершение ветки", "condition": None,
             })
             sources_to_end.add(nid)
-            logger.warning(
-                f"Stage7 post-process: added missing END edge {new_edge_id} "
-                f"from {nid} ({ntype})"
-            )
             data.setdefault("changelog", []).append({
-                "action": "added",
-                "element": "edge",
-                "id": new_edge_id,
-                "reason": f"Автоисправление: {ntype}-узел {nid} не имел ребра к END",
+                "action": "added", "element": "edge", "id": new_id,
+                "reason": f"Автоисправление: {ntype} '{nid}' не имел ребра к END",
             })
+            logger.warning(f"post_process: added END edge {new_id} from {nid}")
 
     data["nodes"] = nodes
     return data
 
 
+# ── Stage class ───────────────────────────────────────────────────────────────
+
 class Stage7Fix(BasePipelineStage):
     stage_name = "stage7_fix"
 
-    def build_prompt(self, graph: dict, verification: dict, source_text: str) -> str:
+    def build_prompt(
+        self,
+        graph: dict,
+        structural_issues: list[dict],
+        clinical_issues: list[dict],
+        missing_scenarios: list[dict],
+        source_text: str,
+    ) -> str:
         nodes = graph.get("graph", {}).get("nodes", [])
         edges = graph.get("graph", {}).get("edges", [])
+
+        all_clinical = clinical_issues + [
+            {"severity": "info", **ms} for ms in missing_scenarios
+            if ms.get("importance") in ("high", "medium")
+        ]
+
         return _PROMPT_TEMPLATE.format(
             nodes_json=json.dumps(nodes, ensure_ascii=False, indent=2)[:6000],
             edges_json=json.dumps(edges, ensure_ascii=False, indent=2)[:4000],
-            accuracy_score=verification.get("clinical_accuracy_score", "N/A"),
-            issues_text=_format_issues(verification.get("issues", [])),
-            missing_text=_format_missing(verification.get("missing_scenarios", [])),
+            all_issues_text=_format_all_issues(structural_issues, all_clinical),
             source_text=source_text[:3000],
         )
 
     def parse_response(self, response_text: str) -> dict:
         cleaned = self._clean_json(response_text)
         data = json.loads(cleaned)
-
         if "nodes" not in data or "edges" not in data:
             raise PipelineError("Stage7: response must contain 'nodes' and 'edges'")
-
-        # Apply deterministic post-processing
-        data = _post_process(data)
-
-        changelog = data.get("changelog", [])
-        added    = sum(1 for c in changelog if c.get("action") == "added")
-        modified = sum(1 for c in changelog if c.get("action") == "modified")
-        removed  = sum(1 for c in changelog if c.get("action") == "removed")
-        logger.info(
-            f"Stage 7: {len(data['nodes'])} nodes, {len(data['edges'])} edges | "
-            f"changelog: +{added} ~{modified} -{removed}"
-        )
         return data
 
-    def _has_actionable_issues(self, verification: dict) -> bool:
-        issues  = verification.get("issues", [])
-        missing = verification.get("missing_scenarios", [])
-        return (
-            any(i.get("severity") in ("critical", "warning") for i in issues)
-            or any(m.get("importance") in ("high", "medium") for m in missing)
-        )
-
-    def run(self, graph: dict, verification: dict, source_text: str) -> dict:
-        """
-        Returns a graph document in the SAME schema as Stage 5 output:
-          { "metadata": {...}, "graph": { "nodes": [...], "edges": [...] } }
-        "changelog" is appended at the top level for metrics.
-        """
-        if not self._has_actionable_issues(verification):
-            logger.info("Stage 7: no actionable issues — running structural check only")
-            # Still run post-processing on the existing graph
-            dummy = {
-                "nodes": graph["graph"]["nodes"],
-                "edges": graph["graph"]["edges"],
-                "changelog": [],
-            }
-            fixed = _post_process(dummy)
-            result = deepcopy(graph)
-            result["graph"]["nodes"] = fixed["nodes"]
-            result["graph"]["edges"] = fixed["edges"]
-            result["changelog"] = fixed.get("changelog", [])
-            return result
-
-        issues  = [i for i in verification.get("issues", []) if i.get("severity") in ("critical", "warning")]
-        missing = [m for m in verification.get("missing_scenarios", []) if m.get("importance") in ("high", "medium")]
-        logger.info(f"Stage 7: fixing {len(issues)} issues, {len(missing)} missing scenarios")
-
-        prompt = self.build_prompt(graph, verification, source_text)
-        fixed  = self._execute_with_retry(prompt)
-
-        # Assemble final document in Stage 5 schema
-        result = deepcopy(graph)
-        result["graph"]["nodes"] = fixed["nodes"]
-        result["graph"]["edges"] = fixed["edges"]
+    def _assemble(self, original_graph: dict, fixed_data: dict, all_changelog: list) -> dict:
+        """Build final document in Stage-5 schema."""
+        result = deepcopy(original_graph)
+        result["graph"]["nodes"] = fixed_data["nodes"]
+        result["graph"]["edges"] = fixed_data["edges"]
         result["metadata"]["version"] = self._bump_version(
             result["metadata"].get("version", "1.0")
         )
-        result["changelog"] = fixed.get("changelog", [])
+        result["changelog"] = all_changelog
         return result
 
     @staticmethod
-    def _bump_version(version: str) -> str:
+    def _bump_version(v: str) -> str:
         try:
-            major, minor = version.split(".")
+            major, minor = v.split(".")
             return f"{major}.{int(minor) + 1}"
         except Exception:
-            return version + ".1"
+            return v + ".1"
+
+    def run(self, graph: dict, verification: dict, source_text: str) -> dict:
+        """
+        Validate → fix loop (up to MAX_FIX_LOOPS LLM calls).
+        Always returns a document in Stage-5 schema.
+        """
+        clinical_issues  = verification.get("issues", [])
+        missing_scenarios = verification.get("missing_scenarios", [])
+
+        # Work on a mutable copy
+        current = deepcopy(graph)
+        node_type_map = {n["id"]: n.get("type") for n in current["graph"]["nodes"]}
+        accumulated_changelog: list[dict] = []
+
+        for loop in range(MAX_FIX_LOOPS):
+            structural_issues = validate(current)
+            critical_structural = [i for i in structural_issues if i["severity"] == "critical"]
+            actionable_clinical = [i for i in clinical_issues if i["severity"] in ("critical", "warning")]
+            important_missing   = [m for m in missing_scenarios if m.get("importance") in ("high", "medium")]
+
+            has_work = bool(critical_structural or actionable_clinical or important_missing)
+
+            if not has_work:
+                logger.info(f"Stage 7 loop {loop + 1}: no issues — done")
+                break
+
+            logger.info(
+                f"Stage 7 loop {loop + 1}/{MAX_FIX_LOOPS}: "
+                f"{len(critical_structural)} structural, "
+                f"{len(actionable_clinical)} clinical issues"
+            )
+
+            prompt = self.build_prompt(
+                current, structural_issues, clinical_issues, missing_scenarios, source_text
+            )
+            fixed = self._execute_with_retry(prompt)
+
+            # Deterministic post-processing
+            fixed = _post_process(fixed, node_type_map)
+
+            # Accumulate changelog
+            accumulated_changelog.extend(fixed.get("changelog", []))
+
+            # Update current graph
+            current["graph"]["nodes"] = fixed["nodes"]
+            current["graph"]["edges"] = fixed["edges"]
+            node_type_map = {n["id"]: n.get("type") for n in fixed["nodes"]}
+
+            # After last loop, run post-process only (no more LLM calls)
+            if loop == MAX_FIX_LOOPS - 1:
+                remaining = validate(current)
+                remaining_critical = [i for i in remaining if i["severity"] == "critical"]
+                if remaining_critical:
+                    logger.warning(
+                        f"Stage 7: {len(remaining_critical)} critical issues remain after "
+                        f"{MAX_FIX_LOOPS} fix loops"
+                    )
+                    for iss in remaining_critical:
+                        logger.warning(f"  [{iss['severity'].upper()}] {iss['description']}")
+        else:
+            # Loop exhausted without clean validation
+            logger.warning("Stage 7: fix loops exhausted")
+
+        # Final pass: always run post_process to catch anything LLM missed
+        dummy = {
+            "nodes":     current["graph"]["nodes"],
+            "edges":     current["graph"]["edges"],
+            "changelog": [],
+        }
+        dummy = _post_process(dummy, node_type_map)
+        accumulated_changelog.extend(dummy.get("changelog", []))
+        current["graph"]["nodes"] = dummy["nodes"]
+        current["graph"]["edges"] = dummy["edges"]
+
+        return self._assemble(graph, {"nodes": current["graph"]["nodes"],
+                                       "edges": current["graph"]["edges"]},
+                              accumulated_changelog)

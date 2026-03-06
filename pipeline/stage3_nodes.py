@@ -13,41 +13,73 @@ PROMPT_TEMPLATE = """Ты — эксперт по построению клин�
 {rules_json}
 
 ═══════════════════════════════════════════
-ТИПЫ УЗЛОВ И СТРОГИЕ ПРАВИЛА ДЛЯ КАЖДОГО:
+ТИПЫ УЗЛОВ:
 ═══════════════════════════════════════════
 
-START — точка входа:
-  • Ровно ОДИН в графе
-  • НЕТ question, НЕТ options, НЕТ action_details — все поля null
-  • label: "Начало консультации"
-  • Единственная его роль — указать на первый DECISION-узел
+START — точка входа, ровно один:
+  • question=null, options=[], action_details=null
 
 DECISION — вопрос с ветвлением:
-  • Содержит question (текст вопроса) и options (список вариантов ответа)
-  • Каждый вариант из options ОБЯЗАН иметь исходящее ребро в Stage 4
-  • action_details = null
+  • question (текст вопроса), options (все возможные варианты)
+  • action_details=null
 
 ACTION — рекомендуемое лечение:
-  • question = null, options = []
-  • action_details ОБЯЗАТЕЛЕН: procedure, implant, timing, evidence_level, contraindications[], notes
-  • После ACTION всегда следует END (через ребро)
+  • question=null, options=[]
+  • action_details обязателен
 
 WARNING — предупреждение:
-  • question = null, options = []
-  • После WARNING всегда следует END (через ребро)
+  • question=null, options=[]
 
-END — завершение ветки:
-  • question = null, options = [], action_details = null
-  • Может быть несколько END-узлов (по одному на каждую терминальную ветку)
+END — завершение ветки (может быть несколько):
+  • question=null, options=[], action_details=null
 
 ═══════════════════════════════════════════
-ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:
+КРИТИЧЕСКИ ВАЖНОЕ ПРАВИЛО — ПАРАМЕТРЫ-ГЛОБАЛЬНЫЕ VS ЛОКАЛЬНЫЕ:
 ═══════════════════════════════════════════
-1. НЕ добавляй question/options в START — только в DECISION
-2. Каждая ветка алгоритма ДОЛЖНА завершаться узлом END
-3. ACTION и WARNING — листовые узлы (из них исходит только ребро к END)
-4. Не дублируй одно и то же лечение — одна процедура = один ACTION-узел
-5. Условия ветвления (возраст, тип перелома) — это атрибуты рёбер, не узлов
+
+Проанализируй все параметры ветвления из правил.
+Раздели их на две группы:
+
+ГЛОБАЛЬНЫЕ параметры — используются В НЕСКОЛЬКИХ разных ветках алгоритма
+(например, возраст влияет на тактику при Pipkin II И при 31A2 И при Garden):
+  → Такой параметр ДОЛЖЕН быть вынесен в начало алгоритма, ПЕРЕД разветвлением
+  → Создай ОДИН DECISION-узел для него (не несколько одинаковых)
+  → Структура: START → DECISION(глобальный) → DECISION(специфический) → ACTION
+
+ЛОКАЛЬНЫЕ параметры — используются только в одной конкретной ветке:
+  → DECISION-узел создаётся внутри этой ветки
+
+ПРИМЕР ПРАВИЛЬНОЙ СТРУКТУРЫ (если возраст глобальный):
+  START
+    └→ DECISION "Возраст" [<60, ≥60]
+         ├→ DECISION "Тип перелома" [для <60]  → ... → ACTION
+         └→ DECISION "Тип перелома" [для ≥60]  → ... → ACTION
+
+ПРИМЕР ПРАВИЛЬНОЙ СТРУКТУРЫ (если тип перелома первичен):
+  START
+    └→ DECISION "Тип перелома" [Pipkin, Garden, 31A]
+         ├→ DECISION "Подтип Pipkin" [I, II, III, IV]
+         │    ├→ Pipkin I → ACTION
+         │    ├→ Pipkin II → DECISION "Возраст" → ACTION  (возраст только здесь)
+         │    └→ ...
+         └→ DECISION "Тип Garden" [I-II, III-IV] → ACTION
+
+АНТИПАТТЕРН (запрещено):
+  ❌ Два разных узла "Возраст пациента" в разных ветках одного алгоритма
+  ❌ Один и тот же вопрос задаётся более одного раза на одном пути
+  ❌ Пациент проходит через один и тот же тип вопроса дважды
+  ❌ Один DECISION-узел достигается из двух веток с разными значениями одного параметра
+     (например, node_003 достигается и через "Младше 60" и через "60+") — это
+     создаёт неопределённость: узел не знает какая тактика нужна.
+     РЕШЕНИЕ: создай два отдельных узла — node_003_young и node_003_old
+
+═══════════════════════════════════════════
+ДРУГИЕ ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:
+═══════════════════════════════════════════
+1. START не имеет question/options
+2. Каждая ветка завершается END
+3. ACTION и WARNING — листовые узлы
+4. Не дублируй одну процедуру в разных узлах без клинической причины
 
 Верни СТРОГО JSON без пояснений, без markdown:
 {{
@@ -95,7 +127,6 @@ class Stage3Nodes(BasePipelineStage):
                 node["type"] = "ACTION"
             if t == "START":
                 start_count += 1
-                # Enforce: START must not have question/options
                 node["question"] = None
                 node["options"] = []
                 node["action_details"] = None
@@ -122,6 +153,20 @@ class Stage3Nodes(BasePipelineStage):
                     if seen_start:
                         node["type"] = "DECISION"
                     seen_start = True
+
+        # Warn about duplicate DECISION questions
+        questions = {}
+        for node in data["nodes"]:
+            if node.get("type") == "DECISION" and node.get("question"):
+                q = node["question"].strip().lower()
+                if q in questions:
+                    logger.warning(
+                        f"Stage3: duplicate question '{node['question']}' "
+                        f"in nodes {questions[q]} and {node['id']} — "
+                        f"consider merging into one DECISION node"
+                    )
+                else:
+                    questions[q] = node["id"]
 
         logger.info(f"Stage 3: built {len(data['nodes'])} nodes")
         return data

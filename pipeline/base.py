@@ -65,7 +65,7 @@ class BasePipelineStage(ABC):
         self._limiter.acquire()
 
         config = genai_types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
             max_output_tokens=8192,
             system_instruction=system if system else None,
         )
