@@ -22,7 +22,7 @@ class PipelineError(Exception):
 
 class BasePipelineStage(ABC):
     stage_name: str = "base"
-    MAX_RETRIES = 3
+    MAX_RETRIES = 10
     RETRY_DELAY = 2
 
     RATE_LIMIT_BACKOFF = 65  # seconds

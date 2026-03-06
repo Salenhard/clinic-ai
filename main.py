@@ -29,6 +29,7 @@ from pipeline import (
     Stage4Edges,
     Stage5Assembly,
     Stage6Verify,
+    Stage7Fix,
     configure_limiter,
 )
 from pipeline.chunker import TextChunker, chunk_summary
@@ -267,14 +268,15 @@ def run_pipeline(
     verbose: bool,
     use_cache: bool,
     requests_per_minute: int = 15,
-    chunk_size: int = 3_000,
-    overlap: int = 1000,
+    chunk_size: int = 25_000,
+    overlap: int = 4000,
 ) -> None:
     logger = logging.getLogger(__name__)
     start_time = time.time()
 
     # ── Init google-genai Client ──────────────────────────────────────────────
     api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = "AIzaSyCwCS_kDXKySsMD659KpiQqw6f6iQZnLwQ"
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable not set")
 
@@ -297,6 +299,7 @@ def run_pipeline(
         "stage4": Stage4Edges(client, **stage_kwargs),
         "stage5": Stage5Assembly(client, **stage_kwargs),
         "stage6": Stage6Verify(client, **stage_kwargs),
+        "stage7": Stage7Fix(client, **stage_kwargs),
     }
 
     failed_stages = []
@@ -410,6 +413,21 @@ def run_pipeline(
         logger.error(f"Stage 6 failed: {e}")
         failed_stages.append("stage6")
 
+    # ── Stage 7: Graph repair ─────────────────────────────────────────────────
+    logger.info("Stage 7: Graph repair based on verification report")
+    fixed_cache = load_cache("stage7_fix") if use_cache else None
+    if fixed_cache:
+        final_graph = fixed_cache
+        logger.info("  (loaded from cache)")
+    else:
+        try:
+            final_graph = stages["stage7"].run(final_graph, verification_result, text)
+            save_cache("stage7_fix", final_graph)
+            stages_completed += 1
+        except PipelineError as e:
+            logger.error(f"Stage 7 failed: {e}")
+            failed_stages.append("stage7")
+
     # ── Metrics ───────────────────────────────────────────────────────────────
     total_tokens = sum(s.tokens_used for s in stages.values())
     rules_extracted = len(rules.get("rules", []))
@@ -441,9 +459,9 @@ def run_pipeline(
     # ── Report ────────────────────────────────────────────────────────────────
     source_name = Path(input_pdf).name
     if HAS_RICH:
-        _print_rich(metrics, verification_result, output_path, metrics_path, 6, failed_stages, source_name)
+        _print_rich(metrics, verification_result, output_path, metrics_path, 7, failed_stages, source_name)
     else:
-        _print_plain(metrics, verification_result, output_path, metrics_path, 6, failed_stages)
+        _print_plain(metrics, verification_result, output_path, metrics_path, 7, failed_stages)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -480,14 +498,14 @@ Examples:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=6_000,
+        default=25_000,
         metavar="N",
         help="Max chars per text chunk sent to LLM",
     )
     parser.add_argument(
         "--overlap",
         type=int,
-        default=1000,
+        default=400,
         metavar="N",
         help="Overlap chars between consecutive chunks (default: 400)",
     )

@@ -5,4 +5,5 @@ from .stage3_nodes import Stage3Nodes
 from .stage4_edges import Stage4Edges
 from .stage5_assembly import Stage5Assembly
 from .stage6_verify import Stage6Verify
+from .stage7_fix import Stage7Fix
 from .rate_limiter import configure_limiter, RateLimiter, get_limiter

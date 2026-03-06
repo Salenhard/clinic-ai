@@ -12,37 +12,60 @@ PROMPT_TEMPLATE = """Ты — эксперт по построению клин�
 ПРАВИЛА:
 {rules_json}
 
-Типы узлов:
-- START: единственная точка входа в алгоритм
-- DECISION: вопрос с ветвлением (да/нет или множественный выбор)
-- ACTION: рекомендуемое лечение/вмешательство
-- WARNING: предупреждение или противопоказание
-- END: завершение ветки консультации
+═══════════════════════════════════════════
+ТИПЫ УЗЛОВ И СТРОГИЕ ПРАВИЛА ДЛЯ КАЖДОГО:
+═══════════════════════════════════════════
 
-Важные требования:
-1. Должен быть РОВНО ОДИН узел START
-2. Каждая ветка должна завершаться узлом END
-3. Узлы DECISION группируют логически связанные условия
-4. Узлы ACTION соответствуют конкретным терапевтическим решениям
-5. Не дублируй узлы — одно и то же действие = один узел ACTION
+START — точка входа:
+  • Ровно ОДИН в графе
+  • НЕТ question, НЕТ options, НЕТ action_details — все поля null
+  • label: "Начало консультации"
+  • Единственная его роль — указать на первый DECISION-узел
 
-Верни СТРОГО JSON без пояснений, без markdown-блоков:
+DECISION — вопрос с ветвлением:
+  • Содержит question (текст вопроса) и options (список вариантов ответа)
+  • Каждый вариант из options ОБЯЗАН иметь исходящее ребро в Stage 4
+  • action_details = null
+
+ACTION — рекомендуемое лечение:
+  • question = null, options = []
+  • action_details ОБЯЗАТЕЛЕН: procedure, implant, timing, evidence_level, contraindications[], notes
+  • После ACTION всегда следует END (через ребро)
+
+WARNING — предупреждение:
+  • question = null, options = []
+  • После WARNING всегда следует END (через ребро)
+
+END — завершение ветки:
+  • question = null, options = [], action_details = null
+  • Может быть несколько END-узлов (по одному на каждую терминальную ветку)
+
+═══════════════════════════════════════════
+ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:
+═══════════════════════════════════════════
+1. НЕ добавляй question/options в START — только в DECISION
+2. Каждая ветка алгоритма ДОЛЖНА завершаться узлом END
+3. ACTION и WARNING — листовые узлы (из них исходит только ребро к END)
+4. Не дублируй одно и то же лечение — одна процедура = один ACTION-узел
+5. Условия ветвления (возраст, тип перелома) — это атрибуты рёбер, не узлов
+
+Верни СТРОГО JSON без пояснений, без markdown:
 {{
   "nodes": [
     {{
       "id": "node_001",
       "type": "START | DECISION | ACTION | WARNING | END",
-      "label": "Человекочитаемое короткое название",
-      "question": "Текст вопроса (только для DECISION-узлов)",
-      "options": ["Вариант А", "Вариант Б", "Вариант В"],
-      "source_rules": ["rule_001", "rule_002"],
+      "label": "...",
+      "question": "текст вопроса или null",
+      "options": ["вариант А", "вариант Б"],
+      "source_rules": ["rule_001"],
       "action_details": {{
-        "procedure": "название процедуры (только для ACTION)",
-        "implant": "тип имплантата или null",
-        "timing": "сроки/нагрузка или null",
-        "evidence_level": "уровень доказательности или null",
+        "procedure": "...",
+        "implant": "...",
+        "timing": "...",
+        "evidence_level": "...",
         "contraindications": [],
-        "notes": "клинические примечания"
+        "notes": "..."
       }}
     }}
   ]
@@ -62,17 +85,46 @@ class Stage3Nodes(BasePipelineStage):
         data = json.loads(cleaned)
         if "nodes" not in data:
             raise PipelineError("Stage3: missing 'nodes' key in response")
-        
-        # Validate node types
+
         valid_types = {"START", "DECISION", "ACTION", "WARNING", "END"}
+        start_count = 0
         for node in data["nodes"]:
-            if node.get("type") not in valid_types:
-                logger.warning(f"Node {node.get('id')} has invalid type: {node.get('type')}")
-                node["type"] = "ACTION"  # fallback
-        
+            t = node.get("type")
+            if t not in valid_types:
+                logger.warning(f"Node {node.get('id')} invalid type '{t}' → ACTION")
+                node["type"] = "ACTION"
+            if t == "START":
+                start_count += 1
+                # Enforce: START must not have question/options
+                node["question"] = None
+                node["options"] = []
+                node["action_details"] = None
+            if t in ("ACTION", "WARNING") and node.get("question"):
+                node["question"] = None
+                node["options"] = []
+
+        if start_count == 0:
+            logger.warning("Stage3: no START node found, adding one")
+            data["nodes"].insert(0, {
+                "id": "node_start",
+                "type": "START",
+                "label": "Начало консультации",
+                "question": None,
+                "options": [],
+                "source_rules": [],
+                "action_details": None,
+            })
+        elif start_count > 1:
+            logger.warning(f"Stage3: {start_count} START nodes found, keeping first only")
+            seen_start = False
+            for node in data["nodes"]:
+                if node["type"] == "START":
+                    if seen_start:
+                        node["type"] = "DECISION"
+                    seen_start = True
+
         logger.info(f"Stage 3: built {len(data['nodes'])} nodes")
         return data
 
     def run(self, rules: dict) -> dict:
-        prompt = self.build_prompt(rules)
-        return self._execute_with_retry(prompt)
+        return self._execute_with_retry(self.build_prompt(rules))
