@@ -31,7 +31,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def validate(graph_doc: dict) -> list[dict]:
+def validate_graph_structure(graph_doc: dict) -> list[dict]:
     """Run all checks and return a list of issues."""
     nodes: list[dict] = graph_doc.get("graph", {}).get("nodes", [])
     edges: list[dict] = graph_doc.get("graph", {}).get("edges", [])
