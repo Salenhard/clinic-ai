@@ -29,33 +29,109 @@ _PROMPT = """\
 {contraindications_json}
 ═══════════════════════════════════════════
 
+═══════════════════════════════════════════
 ПРАВИЛА УЗЛОВ:
+═══════════════════════════════════════════
 • START  — ровно один; question=null, options=[], action_details=null
 • DECISION — question + options (≥2); action_details=null
-• ACTION — question=null, options=[]; action_details обязателен
-• WARNING — question=null, options=[]; используй для предупреждений о запрещённых имплантатах
-• END — question=null, options=[], action_details=null; может быть несколько
+• ACTION — question=null, options=[]; action_details ОБЯЗАТЕЛЕН с полями:
+  procedure, implant, timing, evidence_level, contraindications[], notes
+• WARNING — question=null, options=[]; идёт ДО ACTION (не после)
+• END — question=null, options=[], action_details=null
 
+═══════════════════════════════════════════
 ПРАВИЛА РЁБЕР:
-• START → первый DECISION (condition=null)
-• Каждый вариант DECISION.options → ровно одно ребро; label == вариант из options
-• ACTION → END (condition=null)
-• WARNING → ACTION → END (предупреждение ДО действия, не после)
+═══════════════════════════════════════════
+• START → первый DECISION (condition=null, label=null)
+• Каждый вариант из DECISION.options → РОВНО ОДНО исходящее ребро
+  label ребра ДОЛЖЕН точно совпадать с текстом варианта из options
+• Если вариант из options не имеет ребра — это ОШИБКА (тупик)
+• ACTION → END (condition=null, единственное исходящее ребро)
+• WARNING → ACTION → END
 • Нет дублей (одинаковые from+to), нет самопетель, нет циклов
+• Все узлы достижимы из START
 
-ПРАВИЛО ПАРАМЕТРОВ:
+═══════════════════════════════════════════
+ПРАВИЛО ПАРАМЕТРОВ (глобальные vs локальные):
+═══════════════════════════════════════════
 • Параметр, нужный в нескольких ветках → один DECISION-узел в начале общей ветки
 • Параметр, нужный только в одной ветке → DECISION-узел внутри этой ветки
 • НЕЛЬЗЯ: один DECISION-узел достигается из двух веток с разным значением того же параметра
 • НЕЛЬЗЯ: ребро проверяет поле, уже определённое на пути к этому узлу
 
-ACTION.action_details:
-{{
-  "procedure": "...", "implant": "...", "timing": "...",
-  "evidence_level": "...", "contraindications": [], "notes": "..."
-}}
+═══════════════════════════════════════════
+КРИТИЧЕСКИ ВАЖНО — КАЖДАЯ НОЗОЛОГИЯ РАСКРЫВАЕТСЯ ПОЛНОСТЬЮ:
+═══════════════════════════════════════════
 
-Верни СТРОГО JSON (без metadata — только graph):
+❌ ЗАПРЕЩЁННЫЙ АНТИПАТТЕРН — схлопывание нозологии в один ACTION:
+   DECISION(тип перелома) → "Pipkin" → ACTION("Лечение Pipkin согласно I-IV")
+   Это НЕВЕРНО: Pipkin I, II, III, IV — принципиально разные операции.
+   ACTION описывает ОДНУ конкретную операцию, не группу.
+
+✅ ОБЯЗАТЕЛЬНЫЙ ПАТТЕРН — полное разворачивание каждой ветки:
+   DECISION(тип перелома) → "Pipkin"
+     → DECISION(подтип Pipkin) [options: Pipkin I, Pipkin II, Pipkin III, Pipkin IV]
+         ├─ "Pipkin I"   → ACTION(Удаление фрагмента)           → END
+         ├─ "Pipkin II"  → ACTION(Остеосинтез канюл. винтами)   → END
+         ├─ "Pipkin III" → ACTION(Первичное ТЭТС)               → END
+         └─ "Pipkin IV"  → ACTION(Остеосинтез впадины + головки)→ END
+
+❌ ЗАПРЕЩЕНО — один ACTION-узел для разных нозологий:
+   dec_age_garden → "< 60" → action_fix   ← один узел
+   dec_age_troch  → "< 60" → action_fix   ← тот же узел
+   Garden и Чрезвертельные — разные операции.
+   Каждая нозология/возрастная группа → СВОЙ отдельный ACTION-узел.
+
+❌ ЗАПРЕЩЕНО — нестабильная ветка без разделения по возрасту:
+   dec_stability → "Нестабильный" → ACTION(Статическая фиксация)
+   Тактика при нестабильном переломе разная для < 60 и ≥ 60:
+     < 60: статическая фиксация, отсрочка нагрузки 8-10 нед
+     ≥ 60: динамическая фиксация, ранняя нагрузка
+   ПРАВИЛЬНО: dec_stability → "Нестабильный" → DECISION(возраст) → ACTION(...)
+
+═══════════════════════════════════════════
+ПРИМЕР ПРАВИЛЬНОЙ ПОЛНОЙ СТРУКТУРЫ:
+═══════════════════════════════════════════
+START
+└─→ DECISION "Тип перелома" [Pipkin, Garden, Чрезвертельный]
+      ├─ "Pipkin"
+      │    └─→ DECISION "Подтип Pipkin" [I, II, III, IV]
+      │              ├─ "Pipkin I"   → ACTION(удаление фрагмента)         → END
+      │              ├─ "Pipkin II"  → DECISION(возраст)[<60, >=60]
+      │              │                   ├─ "<60"  → ACTION(остеосинтез)   → END
+      │              │                   └─ ">=60" → ACTION(ТЭТС)         → END
+      │              ├─ "Pipkin III" → ACTION(ТЭТС первичное)              → END
+      │              └─ "Pipkin IV"  → ACTION(остеосинтез впадины)         → END
+      │
+      ├─ "Garden"
+      │    └─→ DECISION "Тип Garden" [I-II, III-IV]
+      │              ├─ "Garden I-II" → WARNING(запрет трёхлопастных гвоздей)
+      │              │                    └─→ ACTION(динамич. фиксация телеск. винтами) → END
+      │              └─ "Garden III-IV"
+      │                   └─→ DECISION "Возраст" [<70, >=70]
+      │                             ├─ "<70"  → ACTION(ТЭТС)              → END
+      │                             └─ ">=70"
+      │                                  └─→ DECISION "Активность" [низкая, высокая]
+      │                                            ├─ "низкая" → ACTION(гемиэндопротез)      → END
+      │                                            └─ "высокая"→ ACTION(ТЭТС дв.мобильности)→ END
+      │
+      └─ "Чрезвертельный"
+           └─→ DECISION "Стабильность" [Стабильный, Нестабильный]
+                     ├─ "Стабильный"  → ACTION(динамич. фиксация, все возрасты) → END
+                     └─ "Нестабильный"
+                          └─→ DECISION "Возраст" [<60, >=60]
+                                    ├─ "<60"  → ACTION(статич. фиксация, отсрочка) → END
+                                    └─ ">=60" → ACTION(динамич. фиксация, ранняя)  → END
+
+═══════════════════════════════════════════
+МИНИМАЛЬНОЕ ЧИСЛО МАРШРУТОВ:
+═══════════════════════════════════════════
+• Pipkin ветка:   ≥ 5 ACTION-узлов (I, II×2, III, IV)
+• Garden ветка:   ≥ 4 ACTION-узлов (I-II, III-IV<70, III-IV>=70×2)
+• Чрезвертельная: ≥ 3 ACTION-узлов (стаб., нестаб.<60, нестаб.>=60)
+Итого ≥ 12. Граф с < 8 ACTION-узлами скорее всего неполный.
+
+Верни СТРОГО JSON (только nodes + edges):
 {{
   "nodes": [
     {{
@@ -134,9 +210,59 @@ class Stage4Graph(BasePipelineStage):
             clean.append(e)
         data["edges"] = clean
 
-        node_types = {n["id"]: n.get("type") for n in data["nodes"]}
+        node_type = {n["id"]: n.get("type") for n in data["nodes"]}
         n_nodes = len(data["nodes"])
         n_actions = sum(1 for n in data["nodes"] if n.get("type") == "ACTION")
+
+        # Warn if too few ACTION nodes (likely collapsed branches)
+        if n_actions < 8:
+            logger.warning(
+                f"Stage4: only {n_actions} ACTION nodes — graph likely has collapsed "
+                f"branches. Expected ≥ 12 for full Pipkin/Garden/Чрезвертельные coverage."
+            )
+
+        # Detect ACTION nodes shared between multiple incoming sources (nozology collapse)
+        incoming: dict[str, list[str]] = {}
+        for e in data["edges"]:
+            dst = e.get("to")
+            src = e.get("from")
+            if dst and src:
+                incoming.setdefault(dst, []).append(src)
+        for nid, srcs in incoming.items():
+            if len(srcs) > 1 and node_type.get(nid) == "ACTION":
+                logger.warning(
+                    f"Stage4: ACTION '{nid}' reached from {len(srcs)} sources {srcs} — "
+                    f"possible nozology collapse (same ACTION for different fracture types)."
+                )
+
+        # Check DECISION options coverage
+        out_edges: dict[str, list[dict]] = {}
+        for e in data["edges"]:
+            out_edges.setdefault(e.get("from"), []).append(e)
+
+        for n in data["nodes"]:
+            if n.get("type") != "DECISION":
+                continue
+            opts = n.get("options") or []
+            out = out_edges.get(n["id"], [])
+            edge_labels = {(e.get("label") or "").strip().lower() for e in out}
+            edge_values: set[str] = set()
+            for e in out:
+                cond = e.get("condition") or {}
+                v = cond.get("value")
+                if v:
+                    edge_values.add(str(v).lower())
+            uncovered = [
+                o for o in opts
+                if o.strip().lower() not in edge_labels
+                and o.strip().lower() not in edge_values
+            ]
+            if uncovered:
+                logger.warning(
+                    f"Stage4: DECISION '{n['id']}' has uncovered options: {uncovered} — "
+                    f"these will create dead ends."
+                )
+
         logger.info(f"Stage 4: {n_nodes} nodes ({n_actions} actions), {len(data['edges'])} edges")
         return data
 

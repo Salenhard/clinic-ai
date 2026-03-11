@@ -47,6 +47,16 @@ _PROMPT = """\
 • НЕЛЬЗЯ: ребро проверяет поле, уже определённое на пути к этому узлу
 • НЕЛЬЗЯ: один DECISION-узел доступен из двух веток с разным значением одного параметра
 
+РАЗВОРАЧИВАНИЕ ВЕТОК — ОБЯЗАТЕЛЬНО:
+• ACTION должен описывать ОДНУ конкретную операцию, не группу ("Лечение Pipkin I-IV" — ОШИБКА)
+• Если ACTION схлопывает несколько нозологий — замени его на DECISION + отдельные ACTION:
+  "Лечение Pipkin" → DECISION(подтип)[I,II,III,IV] → ACTION(I), ACTION(II), ACTION(III), ACTION(IV)
+• Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
+• Нестабильный перелом без разделения по возрасту — ОШИБКА, добавь DECISION(возраст)
+
+МИНИМУМ ACTION-узлов для полного покрытия:
+  Pipkin: ≥5, Garden: ≥4, Чрезвертельные: ≥3. Итого ≥12.
+
 Новые id: node_fix_NNN / edge_fix_NNN
 Сохрани существующие id без изменений.
 
@@ -81,6 +91,52 @@ def _format_issues(structural: list[dict], clinical: list[dict]) -> str:
             lines.append(f"  {i}. [{m.get('importance','').upper()}] {m.get('description','')}")
     return "\n".join(lines) if lines else "Проблем не выявлено."
 
+
+
+def _remove_unreachable(data: dict, accumulated_changelog: list) -> dict:
+    """Remove nodes that are not reachable from START (deterministic, no LLM)."""
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+
+    starts = [n["id"] for n in nodes if n.get("type") == "START"]
+    if not starts:
+        return data
+
+    # BFS from START
+    out_map: dict[str, list[str]] = {}
+    for e in edges:
+        src, dst = e.get("from"), e.get("to")
+        if src and dst:
+            out_map.setdefault(src, []).append(dst)
+
+    reachable: set[str] = set()
+    queue = deque(starts)
+    while queue:
+        cur = queue.popleft()
+        if cur in reachable:
+            continue
+        reachable.add(cur)
+        for dst in out_map.get(cur, []):
+            queue.append(dst)
+
+    node_ids = {n["id"] for n in nodes}
+    unreachable = node_ids - reachable
+    if not unreachable:
+        return data
+
+    for uid in unreachable:
+        logger.warning(f"post_process: removing unreachable node '{uid}'")
+        accumulated_changelog.append({
+            "action": "removed", "element": "node", "id": uid,
+            "reason": f"Детерминистическое удаление: узел недостижим из START",
+        })
+
+    data["nodes"] = [n for n in nodes if n["id"] not in unreachable]
+    data["edges"] = [
+        e for e in edges
+        if e.get("from") not in unreachable and e.get("to") not in unreachable
+    ]
+    return data
 
 def _post_process(data: dict) -> dict:
     nodes = data.get("nodes", [])
@@ -165,6 +221,10 @@ class Stage5bFix(BasePipelineStage):
             edges_json=json.dumps(edges, ensure_ascii=False, indent=2)[:3500],
             issues_text=_format_issues(structural_issues, all_clinical),
             source_text=source_text[:2000],
+            algorithm_json=json.dumps(
+                self._algorithm.get("algorithm", self._algorithm) if self._algorithm else {},
+                ensure_ascii=False,
+            )[:3000],
         )
 
     def parse_response(self, response_text: str) -> dict:
@@ -178,7 +238,9 @@ class Stage5bFix(BasePipelineStage):
         graph: dict,
         validation: dict,
         source_text: str,
+        algorithm: dict | None = None,
     ) -> dict:
+        self._algorithm = algorithm  # store for build_prompt access
         clinical_issues = validation.get("issues", [])
         missing_scenarios = validation.get("missing_scenarios", [])
 

@@ -71,6 +71,7 @@ class Stage3Algorithm(BasePipelineStage):
         arthroplasty: dict,
         fracture_treatments: dict,
         factors: dict,
+        source_text: str = "",
     ) -> str:
         def _trim(d, key, n=3000):
             return json.dumps(d.get(key, []), ensure_ascii=False)[:n]
@@ -80,6 +81,7 @@ class Stage3Algorithm(BasePipelineStage):
             arthroplasty_json=_trim(arthroplasty, "arthroplasty_methods"),
             fracture_json=_trim(fracture_treatments, "fracture_treatments"),
             factors_json=_trim(factors, "patient_factors"),
+            source_text=source_text[:2500] if source_text else "не предоставлен",
         )
 
     def parse_response(self, response_text: str) -> dict:
@@ -91,6 +93,31 @@ class Stage3Algorithm(BasePipelineStage):
             f"Stage 3: {len(branches)} branches, "
             f"entry='{data['algorithm'].get('entry_question', '')[:60]}'"
         )
+
+        # Validate branch structure: every option must go somewhere
+        issues = []
+        branch_ids = {b["id"] for b in branches}
+        for b in branches:
+            opts = b.get("options", [])
+            terminals = b.get("terminals", {})
+            sub_branches = b.get("sub_branches", [])
+            covered = set(terminals.keys()) | set()
+            for sb in sub_branches:
+                # Find which option leads to this sub-branch
+                for opt in opts:
+                    pass  # sub_branches don't specify which option; just check they exist
+            # Check sub_branch ids exist
+            for sb_id in sub_branches:
+                if sb_id not in branch_ids:
+                    issues.append(f"branch '{b['id']}': sub_branch '{sb_id}' not found")
+            uncovered = [o for o in opts if o not in terminals and len(sub_branches) == 0]
+            if uncovered:
+                issues.append(
+                    f"branch '{b['id']}': options {uncovered} have no terminal and no sub_branch"
+                )
+        if issues:
+            for iss in issues:
+                logger.warning(f"Stage 3 branch validation: {iss}")
         return data
 
     def run(
@@ -99,6 +126,9 @@ class Stage3Algorithm(BasePipelineStage):
         arthroplasty: dict,
         fracture_treatments: dict,
         factors: dict,
+        source_text: str = "",
     ) -> dict:
-        prompt = self.build_prompt(osteosynthesis, arthroplasty, fracture_treatments, factors)
+        prompt = self.build_prompt(
+            osteosynthesis, arthroplasty, fracture_treatments, factors, source_text
+        )
         return self._execute_with_retry(prompt)

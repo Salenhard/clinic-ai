@@ -13,8 +13,6 @@ from .chunker import Chunk
 
 logger = logging.getLogger(__name__)
 
-class RateLimiterError(Exception):
-    pass
 
 class PipelineError(Exception):
     pass
@@ -22,7 +20,7 @@ class PipelineError(Exception):
 
 class BasePipelineStage(ABC):
     stage_name: str = "base"
-    MAX_RETRIES = 10
+    MAX_RETRIES = 3
     RETRY_DELAY = 2
 
     RATE_LIMIT_BACKOFF = 65  # seconds
@@ -30,7 +28,7 @@ class BasePipelineStage(ABC):
     def __init__(
         self,
         client,
-        model: str = "gemini-3.1-flash-lite-preview",
+        model: str = "gemini-2.0-flash",
         requests_per_minute: int = 15,
     ):
         self.client = client
@@ -61,16 +59,25 @@ class BasePipelineStage(ABC):
 
     # ── Single LLM call ───────────────────────────────────────────────────────
 
+    # Default system instruction injected in every LLM call
+    _SYSTEM_INSTRUCTION = (
+        "Ты эксперт по клинической хирургии и медицинским алгоритмам принятия решений. "
+        "Ты помогаешь строить формализованные графы клинических рекомендаций по травматологии. "
+        "Отвечай только валидным JSON без лишних пояснений. "
+        "Используй только сведения из предоставленного текста — не придумывай данные."
+    )
+
     def _call_llm(self, prompt: str, system: Optional[str] = None) -> str:
         self._limiter.acquire()
 
+        sys_instr = system if system else self._SYSTEM_INSTRUCTION
         config = genai_types.GenerateContentConfig(
-            temperature=0.0,
+            temperature=0.1,
             max_output_tokens=8192,
-            system_instruction=system if system else None,
+            system_instruction=sys_instr,
         )
         try:
-            response = self.client.models.generate_content_stream(
+            response = self.client.models.generate_content(
                 model=self.model,
                 contents=prompt,
                 config=config,
@@ -83,7 +90,7 @@ class BasePipelineStage(ABC):
                     f"backing off {self.RATE_LIMIT_BACKOFF}s ..."
                 )
                 time.sleep(self.RATE_LIMIT_BACKOFF)
-                response = self.client.models.generate_content_stream(
+                response = self.client.models.generate_content(
                     model=self.model,
                     contents=prompt,
                     config=config,
@@ -95,10 +102,8 @@ class BasePipelineStage(ABC):
         if meta:
             self.tokens_used += getattr(meta, "prompt_token_count", 0)
             self.tokens_used += getattr(meta, "candidates_token_count", 0)
-        result = ""
-        for chunk in response:
-            result += chunk.text
-        return result
+
+        return response.text
 
     # ── JSON repair ───────────────────────────────────────────────────────────
 
@@ -141,14 +146,21 @@ class BasePipelineStage(ABC):
 
     # ── Chunked execution ─────────────────────────────────────────────────────
 
+    # Max workers for parallel chunk processing.
+    # Rate limiter is shared, so parallelism helps only when chunks >> RPM slots.
+    # Set to 1 to disable parallelism (sequential).
+    CHUNK_WORKERS = 3
+
     def _execute_over_chunks(
         self,
         chunks: List[Chunk],
-        build_prompt_fn,          # (chunk_text, chunk_index, total_chunks) -> str
-        merge_fn,                 # (list[dict]) -> dict
+        build_prompt_fn,
+        merge_fn,
     ) -> dict:
         """
         Run the stage prompt over each chunk independently, then merge results.
+        Chunks are processed in parallel (up to CHUNK_WORKERS threads).
+        The shared rate limiter serializes actual API calls as needed.
 
         Parameters
         ----------
@@ -156,31 +168,41 @@ class BasePipelineStage(ABC):
         build_prompt_fn : callable(chunk_text, chunk_index, total_chunks) → prompt str
         merge_fn        : callable(list[dict]) → merged dict
         """
+        import concurrent.futures
+
         if len(chunks) == 1:
-            # Fast path — no merging needed
             return self._execute_with_retry(
                 build_prompt_fn(chunks[0].text, 0, 1)
             )
 
-        results = []
-        for chunk in chunks:
+        def _process_chunk(chunk: Chunk) -> Optional[dict]:
             logger.info(
-                f"{self.stage_name}: processing chunk {chunk.index + 1}/{len(chunks)} "
+                f"{self.stage_name}: chunk {chunk.index + 1}/{len(chunks)} "
                 f"({chunk.char_count:,} chars)"
             )
             prompt = build_prompt_fn(chunk.text, chunk.index, len(chunks))
             try:
-                result = self._execute_with_retry(prompt)
-                results.append(result)
+                return self._execute_with_retry(prompt)
             except PipelineError as e:
                 logger.error(f"{self.stage_name} chunk {chunk.index} failed: {e}")
-                # Continue with remaining chunks — don't abort entire stage
+                return None
 
+        workers = min(self.CHUNK_WORKERS, len(chunks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_chunk, chunk): chunk for chunk in chunks}
+            ordered_results = [None] * len(chunks)
+            for fut in concurrent.futures.as_completed(futures):
+                chunk = futures[fut]
+                ordered_results[chunk.index] = fut.result()
+
+        results = [r for r in ordered_results if r is not None]
         if not results:
             raise PipelineError(f"{self.stage_name}: all chunks failed")
 
         merged = merge_fn(results)
-        logger.info(f"{self.stage_name}: merged {len(results)} chunk results")
+        logger.info(
+            f"{self.stage_name}: merged {len(results)}/{len(chunks)} chunk results"
+        )
         return merged
 
     # ── Abstract interface ────────────────────────────────────────────────────
