@@ -60,8 +60,11 @@ cp .env.example .env
 cp guidelines.pdf data/input/
 
 # 3. Собрать и запустить
-make build
-make run
+docker compose run --rm clinical-graph-builder \
+  --input  /data/input/guidelines.pdf \
+  --output /data/output/graph.json \
+  --metrics /data/output/metrics.json \
+  --max-fix-iterations 5
 ```
 
 Результаты появятся в `data/output/graph.json` и `data/output/metrics.json`.
