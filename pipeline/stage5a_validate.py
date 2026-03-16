@@ -78,7 +78,7 @@ class Stage5aValidate(BasePipelineStage):
     ) -> str:
         g = graph if "nodes" in graph else graph.get("graph", graph)
         return _PROMPT.format(
-            graph_json=json.dumps(g, ensure_ascii=False)[:6000],
+            graph_json=json.dumps(g, ensure_ascii=False)[:12000],
             osteosynthesis_json=json.dumps(
                 osteosynthesis.get("osteosynthesis_methods", []), ensure_ascii=False)[:2000],
             arthroplasty_json=json.dumps(

@@ -25,20 +25,34 @@ _PROMPT = """\
 ПРАВИЛА УЗЛОВ:
 • START  — ровно один; question=null, options=[], action_details=null
 • DECISION — question + options (≥2); action_details=null
-• ACTION — question=null, options=[]; action_details ОБЯЗАТЕЛЕН с полями:
-  procedure, implant, timing, notes
+• ACTION — question=null, options=[]; action_details ОБЯЗАТЕЛЕН (procedure, implant, timing, notes)
 • WARNING — question=null, options=[]; идёт ДО ACTION (не после)
 • END — question=null, options=[], action_details=null
-• Сначало должен определятся возвраст, а затем тип перелома, далее идут остальные дополнительные вопросы
+
 ПРАВИЛА РЁБЕР:
 • START → первый DECISION (condition=null, label=null)
 • Каждый вариант из DECISION.options → РОВНО ОДНО исходящее ребро
-  label ребра ДОЛЖЕН точно совпадать с текстом варианта из options
-• Если вариант из options не имеет ребра — это ОШИБКА (тупик)
+• label ребра ДОЛЖЕН точно совпадать с текстом варианта из options
+• Если вариант из options не имеет ребра — ОШИБКА (тупик)
 • ACTION → END (condition=null, единственное исходящее ребро)
 • WARNING → ACTION → END
-• одинаковые from+to, нет самопетель, нет циклов
+• Нет дублей (одинаковые from+to), нет самопетель, нет циклов
 • Все узлы достижимы из START
+
+КРИТИЧЕСКИЕ ПРАВИЛА СТРУКТУРЫ:
+
+ЗАПРЕЩЕНО — объединять нозологии в один ACTION:
+   ACTION "Остеосинтез" ← и от Garden <60, и от Pipkin II <60
+   Каждая нозология × возраст × метод = ОТДЕЛЬНЫЙ ACTION-узел.
+
+ЗАПРЕЩЕНО — пропускать ветки:
+   Если в options есть "Нестабильный" — ОБЯЗАТЕЛЬНО должно быть ребро от него.
+   Если в options есть ">= 60" — ОБЯЗАТЕЛЬНО должно быть ребро от него.
+
+СТРОГО ЗАПРЕЩЕНЫ ПАТТЕРНЫ:
+• Два ребра с одинаковым label из одного DECISION-узла
+• DECISION-узел с options где хотя бы один вариант не имеет ребра
+• ACTION-узел с несколькими входящими рёбрами из разных нозологий
 
 Верни СТРОГО JSON (только nodes + edges):
 {{

@@ -1,4 +1,5 @@
 from .base import PipelineError, BasePipelineStage
+from .stage0_images import Stage0Images
 from .stage1a_osteosynthesis import Stage1aOsteosynthesis
 from .stage1b_arthroplasty import Stage1bArthroplasty
 from .stage1c_fracture_specific import Stage1cFractureSpecific

@@ -16,6 +16,11 @@ MAX_FIX_LOOPS = 2
 _PROMPT = """\
 Исправь граф принятия решений на основе отчёта о проблемах.
 
+РЕЖИМ РАБОТЫ — ТОЧЕЧНЫЕ ПРАВКИ:
+НЕ перестраивай граф с нуля. Вноси только минимально необходимые изменения для устранения указанных проблем.
+Сохраняй все существующие узлы и рёбра, которые не упомянуты в проблемах.
+Каждое изменение ДОЛЖНО быть отражено в changelog.
+
 ТЕКУЩИЙ ГРАФ:
 Узлы:
 {nodes_json}
@@ -56,13 +61,15 @@ _PROMPT = """\
   "Лечение Pipkin" → DECISION(подтип)[I,II,III,IV] → ACTION(I), ACTION(II), ACTION(III), ACTION(IV)
 • Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
 
-МИНИМУМ ACTION-узлов для полного покрытия:
-  Pipkin: ≥5, Garden: ≥4, Чрезвертельные: ≥3. Итого ≥12.
 Верни СТРОГО JSON:
 {{
-  "nodes": [...],
-  "edges": [...],
-}}"""
+  "nodes": [...все узлы, включая неизменённые...],
+  "edges": [...все рёбра, включая неизменённые...],
+  "changelog": [
+    {{"action": "added|modified|removed", "element": "node|edge", "id": "...", "reason": "..."}}
+  ]
+}}
+ВАЖНО: changelog ОБЯЗАТЕЛЕН. Пустой changelog означает что ничего не изменилось — это ошибка если проблемы были."""
 
 
 def _format_issues(structural: list[dict], clinical: list[dict]) -> str:
@@ -193,6 +200,22 @@ def _post_process(data: dict) -> dict:
                        if n.get("id", "").startswith("node_missing_")) + 1
 
     end_nodes = [n["id"] for n in nodes if n.get("type") == "END"]
+
+    # Consolidate multiple END nodes into one
+    if len(end_nodes) > 1:
+        canonical_end = end_nodes[0]
+        redundant = set(end_nodes[1:])
+        logger.warning(
+            f"_post_process: {len(end_nodes)} END nodes found — "
+            f"merging {redundant} → '{canonical_end}'"
+        )
+        for e in data["edges"]:
+            if e.get("to") in redundant:
+                e["to"] = canonical_end
+        nodes = [n for n in nodes if n["id"] not in redundant]
+        node_type = {n["id"]: n.get("type") for n in nodes}
+        end_nodes = [canonical_end]
+
     # Ensure END exists before we reference it
     if not end_nodes:
         end_id = "node_end"
@@ -213,10 +236,11 @@ def _post_process(data: dict) -> dict:
         out_labels = {(e.get("label") or "").strip().lower() for e in out_edges}
         out_values = set()
         for e in out_edges:
-            cond = e.get("condition") or {}
-            v = cond.get("value")
-            if v:
-                out_values.add(str(v).strip().lower())
+            cond = e.get("condition")
+            if isinstance(cond, dict):
+                v = cond.get("value")
+                if v:
+                    out_values.add(str(v).strip().lower())
 
         for opt in options:
             opt_lower = opt.strip().lower()
@@ -285,6 +309,56 @@ def _post_process(data: dict) -> dict:
     return data
 
 
+def _diff_changelog(before: dict, after: dict) -> list[dict]:
+    """Generate changelog by diffing nodes and edges before/after fix."""
+    before_nodes = {n["id"]: n for n in before.get("nodes", [])}
+    after_nodes  = {n["id"]: n for n in after.get("nodes", [])}
+    before_edges = {e["id"]: e for e in before.get("edges", []) if e.get("id")}
+    after_edges  = {e["id"]: e for e in after.get("edges", []) if e.get("id")}
+
+    log = []
+
+    # Nodes: added / removed / modified
+    for nid, n in after_nodes.items():
+        if nid not in before_nodes:
+            log.append({"action": "added", "element": "node", "id": nid,
+                        "reason": f"Добавлен узел [{n.get('type')}] {n.get('label', '')}"})
+        else:
+            b = before_nodes[nid]
+            changes = []
+            for field in ("type", "label", "question", "options"):
+                if b.get(field) != n.get(field):
+                    changes.append(field)
+            if b.get("action_details") != n.get("action_details"):
+                changes.append("action_details")
+            if changes:
+                log.append({"action": "modified", "element": "node", "id": nid,
+                            "reason": f"Изменены поля: {', '.join(changes)}"})
+
+    for nid in before_nodes:
+        if nid not in after_nodes:
+            log.append({"action": "removed", "element": "node", "id": nid,
+                        "reason": "Узел удалён при исправлении"})
+
+    # Edges: added / removed / modified
+    for eid, e in after_edges.items():
+        if eid not in before_edges:
+            log.append({"action": "added", "element": "edge", "id": eid,
+                        "reason": f"Добавлено ребро {e.get('from')} → {e.get('to')} [{e.get('label','')}]"})
+        else:
+            b = before_edges[eid]
+            if b.get("from") != e.get("from") or b.get("to") != e.get("to") or b.get("label") != e.get("label"):
+                log.append({"action": "modified", "element": "edge", "id": eid,
+                            "reason": f"Изменено ребро: {e.get('from')} → {e.get('to')}"})
+
+    for eid in before_edges:
+        if eid not in after_edges:
+            log.append({"action": "removed", "element": "edge", "id": eid,
+                        "reason": "Ребро удалено при исправлении"})
+
+    return log
+
+
 class Stage5bFix(BasePipelineStage):
     stage_name = "stage5b_fix"
 
@@ -318,7 +392,55 @@ class Stage5bFix(BasePipelineStage):
         data = json.loads(self._clean_json(response_text))
         if "nodes" not in data or "edges" not in data:
             raise PipelineError("Stage5b: missing 'nodes' or 'edges'")
+
+        # Regression guard: LLM must not reduce ACTION node count vs input
+        n_actions_out = sum(1 for n in data["nodes"] if n.get("type") == "ACTION")
+        n_missing_out = sum(
+            1 for n in data["nodes"]
+            if "Требует уточнения" in (n.get("label") or "")
+        )
+        n_real_actions_out = n_actions_out - n_missing_out
+
+        if hasattr(self, "_input_action_count"):
+            if n_real_actions_out < self._input_action_count:
+                raise PipelineError(
+                    f"Stage5b regression: input had {self._input_action_count} real ACTION nodes, "
+                    f"output has only {n_real_actions_out} — LLM rebuilt graph and lost coverage. Retrying."
+                )
+
         return data
+
+    def _merge_graphs(self, base: dict, patch: dict) -> dict:
+        """Merge patch into base: add new nodes/edges, update existing by id.
+        Never removes nodes that were in base unless they appear in patch as different type.
+        """
+        base_nodes = {n["id"]: n for n in base.get("nodes", [])}
+        base_edges = {e["id"]: e for e in base.get("edges", []) if e.get("id")}
+
+        # Apply patch nodes: update existing, add new
+        for n in patch.get("nodes", []):
+            base_nodes[n["id"]] = n
+
+        # Apply patch edges: update existing, add new
+        for e in patch.get("edges", []):
+            eid = e.get("id")
+            if eid:
+                base_edges[eid] = e
+            else:
+                # edge without id — add only if from+to pair is new
+                pair = (e.get("from"), e.get("to"))
+                if not any(
+                    (ex.get("from"), ex.get("to")) == pair
+                    for ex in base_edges.values()
+                ):
+                    synthetic_id = f"edge_merge_{len(base_edges):03d}"
+                    e["id"] = synthetic_id
+                    base_edges[synthetic_id] = e
+
+        return {
+            "nodes": list(base_nodes.values()),
+            "edges": list(base_edges.values()),
+        }
 
     def run(
         self,
@@ -327,7 +449,7 @@ class Stage5bFix(BasePipelineStage):
         source_text: str,
         algorithm: dict | None = None,
     ) -> dict:
-        self._algorithm = algorithm  # store for build_prompt access
+        self._algorithm = algorithm
         clinical_issues = validation.get("issues", [])
         missing_scenarios = validation.get("missing_scenarios", [])
 
@@ -335,6 +457,20 @@ class Stage5bFix(BasePipelineStage):
         current = deepcopy(graph)
         if "graph" in current:
             current = current["graph"]
+
+        # Snapshot of original for final changelog
+        original = deepcopy(current)
+
+        # Store input ACTION count for regression guard in parse_response
+        self._input_action_count = sum(
+            1 for n in current.get("nodes", [])
+            if n.get("type") == "ACTION"
+            and "Требует уточнения" not in (n.get("label") or "")
+        )
+        logger.info(
+            f"Stage 5b: input has {self._input_action_count} real ACTION nodes, "
+            f"{len(current.get('nodes', []))} total nodes"
+        )
 
         for loop in range(MAX_FIX_LOOPS):
             graph_doc = {"graph": current}
@@ -356,7 +492,10 @@ class Stage5bFix(BasePipelineStage):
             )
             fixed = self._execute_with_retry(prompt)
             fixed = _post_process(fixed)
-            current = {"nodes": fixed["nodes"], "edges": fixed["edges"]}
+
+            # Merge instead of replace: keeps all nodes from input, adds new from LLM
+            merged = self._merge_graphs(current, fixed)
+            current = merged
 
         # Deterministic: remove unreachable nodes
         current = _remove_unreachable(current)
@@ -364,7 +503,15 @@ class Stage5bFix(BasePipelineStage):
         # Final deterministic pass
         final = _post_process({"nodes": current["nodes"], "edges": current["edges"]})
 
+        # Generate changelog by diffing original → final
+        changelog = _diff_changelog(original, final)
+        logger.info(f"Stage 5b changelog: {len(changelog)} entries "
+                    f"(+{sum(1 for c in changelog if c['action']=='added')} "
+                    f"~{sum(1 for c in changelog if c['action']=='modified')} "
+                    f"-{sum(1 for c in changelog if c['action']=='removed')})")
+
         return {
             "nodes": final["nodes"],
             "edges": final["edges"],
+            "changelog": changelog,
         }
