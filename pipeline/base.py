@@ -22,8 +22,8 @@ class BasePipelineStage(ABC):
     stage_name: str = "base"
     MAX_RETRIES = 3
     RETRY_DELAY = 2
-
     RATE_LIMIT_BACKOFF = 65  # seconds
+    MAX_OUTPUT_TOKENS = 8192  # override per stage if needed
 
     def __init__(
         self,
@@ -73,7 +73,7 @@ class BasePipelineStage(ABC):
         sys_instr = system if system else self._SYSTEM_INSTRUCTION
         config = genai_types.GenerateContentConfig(
             temperature=0.1,
-            max_output_tokens=8192,
+            max_output_tokens=self.MAX_OUTPUT_TOKENS,
             system_instruction=sys_instr,
         )
         try:

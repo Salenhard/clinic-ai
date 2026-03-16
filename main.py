@@ -427,6 +427,15 @@ def main():
     metrics["stage4_nodes"] = len(raw_graph.get("nodes", []))
     metrics["stage4_edges"] = len(raw_graph.get("edges", []))
 
+    # Log fracture types that Stage 4 couldn't fit (likely hit output token limit)
+    stage4_missing = getattr(stages["4"], "missing_fracture_types", [])
+    if stage4_missing:
+        metrics["stage4_missing_fracture_types"] = stage4_missing
+        logger.warning(
+            f"Stage 4: graph is partial — {len(stage4_missing)} fracture type(s) "
+            f"will be completed by Stage 5b: {stage4_missing}"
+        )
+
     # ── Branch coverage check (deterministic) ────────────────────────────────
     if raw_graph and algorithm:
         branches = algorithm.get("algorithm", {}).get("branches", [])
@@ -460,95 +469,143 @@ def main():
     validation:     dict = {}
     metrics["fix_iterations"] = []
 
-    logger.info(
-        f"Starting validate→fix loop (max {MAX_FIX_ITERATIONS} iterations, "
-        f"threshold={FIX_SCORE_THRESHOLD})"
+    # If Stage 4 produced a complete graph (no missing fracture types and no
+    # structural issues), skip the validate→fix loop entirely to avoid
+    # Stage 5b accidentally degrading a correct graph.
+    stage4_complete = (
+        not stage4_missing
+        and len([
+            i for i in validate_graph_structure({"graph": raw_graph})
+            if i["severity"] == "critical"
+        ]) == 0
     )
-
-    for iteration in range(1, MAX_FIX_ITERATIONS + 1):
-        iter_label = f"iter{iteration}"
-        logger.info(f"── Iteration {iteration}/{MAX_FIX_ITERATIONS} ──────────────────")
-
-        # ── 5a: Validate ──────────────────────────────────────────────────────
-        logger.info(f"  [5a] Validating graph (iteration {iteration})...")
-        validation = _run(
-            f"stage5a_{iter_label}",
-            lambda g=current_graph: stages["5a"].run(
-                g, osteosynthesis, arthroplasty, fracture_treatments, text
-            ),
-        ) or {}
-
-        score       = validation.get("completeness_score", 0) or 0
-        crit_struct = validation.get("structural_critical", 0) or 0
-        crit_llm    = sum(
-            1 for i in validation.get("issues", [])
-            if i.get("severity") == "critical"
-        )
-        n_missing   = len(validation.get("missing_fracture_types", []))
-
-        iter_metrics = {
-            "iteration":          iteration,
-            "completeness_score": score,
-            "structural_critical": crit_struct,
-            "llm_critical_issues": crit_llm,
-            "missing_fracture_types": validation.get("missing_fracture_types", []),
-        }
-        metrics["fix_iterations"].append(iter_metrics)
-
+    if stage4_complete:
         logger.info(
-            f"  [5a] score={score:.2f}  struct_crit={crit_struct}  "
-            f"llm_crit={crit_llm}  missing={n_missing}"
+            "Stage 4 graph is complete and structurally valid — "
+            "skipping validate→fix loop."
         )
-
-        # ── Early exit: graph is good enough ─────────────────────────────────
-        if score >= FIX_SCORE_THRESHOLD and crit_struct == 0 and crit_llm == 0:
-            logger.info(
-                f"  ✅ Graph satisfactory after iteration {iteration} — "
-                f"stopping loop"
-            )
-            break
-
-        # ── Early exit: last iteration reached ───────────────────────────────
-        if iteration == MAX_FIX_ITERATIONS:
-            logger.warning(
-                f"   Max iterations reached ({MAX_FIX_ITERATIONS}) — "
-                f"using best graph so far (score={score:.2f})"
-            )
-            break
-
-        # ── 5b: Fix ───────────────────────────────────────────────────────────
-        logger.info(f"  [5b] Fixing graph (iteration {iteration})...")
-        fixed = _run(
-            f"stage5b_{iter_label}",
-            lambda g=current_graph, v=validation: stages["5b"].run(
-                g, v, text, algorithm=algorithm
-            ),
-        )
-
-        if fixed is None:
-            logger.error(f"  [5b] Fix failed at iteration {iteration} — keeping previous graph")
-            break
-
-        # Accumulate changelog from this fix iteration
-        iter_changelog = fixed.get("changelog", [])
-        for entry in iter_changelog:
-            entry.setdefault("fix_iteration", iteration)
-        accumulated_changelog.extend(iter_changelog)
-
-        # Update current graph for next iteration
-        current_graph = {
-            "nodes":     fixed.get("nodes", current_graph.get("nodes", [])),
-            "edges":     fixed.get("edges", current_graph.get("edges", [])),
-            "changelog": accumulated_changelog,
-        }
-
-        n_nodes = len(current_graph["nodes"])
-        n_edges = len(current_graph["edges"])
-        n_act   = sum(1 for n in current_graph["nodes"] if n.get("type") == "ACTION")
+        metrics["fix_loop_skipped"] = True
+        metrics["fix_iterations"] = []
+        validation = {"completeness_score": None, "issues": [], "missing_scenarios": []}
+    else:
+        metrics["fix_loop_skipped"] = False
         logger.info(
-            f"  [5b] Graph updated: {n_nodes} nodes ({n_act} actions), "
-            f"{n_edges} edges, {len(iter_changelog)} changelog entries"
+            f"Starting validate→fix loop (max {MAX_FIX_ITERATIONS} iterations, "
+            f"threshold={FIX_SCORE_THRESHOLD})"
         )
+
+    if not stage4_complete:
+      for iteration in range(1, MAX_FIX_ITERATIONS + 1):
+          iter_label = f"iter{iteration}"
+          logger.info(f"── Iteration {iteration}/{MAX_FIX_ITERATIONS} ──────────────────")
+
+          # ── 5a: Validate ──────────────────────────────────────────────────────
+          logger.info(f"  [5a] Validating graph (iteration {iteration})...")
+          validation = _run(
+              f"stage5a_{iter_label}",
+              lambda g=current_graph: stages["5a"].run(
+                  g, osteosynthesis, arthroplasty, fracture_treatments, text
+              ),
+          ) or {}
+
+          score       = validation.get("completeness_score", 0) or 0
+          crit_struct = validation.get("structural_critical", 0) or 0
+          crit_llm    = sum(
+              1 for i in validation.get("issues", [])
+              if i.get("severity") == "critical"
+          )
+          n_missing   = len(validation.get("missing_fracture_types", []))
+
+          iter_metrics = {
+              "iteration":          iteration,
+              "completeness_score": score,
+              "structural_critical": crit_struct,
+              "llm_critical_issues": crit_llm,
+              "missing_fracture_types": validation.get("missing_fracture_types", []),
+          }
+          metrics["fix_iterations"].append(iter_metrics)
+
+          logger.info(
+              f"  [5a] score={score:.2f}  struct_crit={crit_struct}  "
+              f"llm_crit={crit_llm}  missing={n_missing}"
+          )
+
+          # ── Early exit: graph is good enough ─────────────────────────────────
+          if score >= FIX_SCORE_THRESHOLD and crit_struct == 0 and crit_llm == 0:
+              logger.info(
+                  f"  ✅ Graph satisfactory after iteration {iteration} — "
+                  f"stopping loop"
+              )
+              break
+
+          # ── Early exit: last iteration reached ───────────────────────────────
+          if iteration == MAX_FIX_ITERATIONS:
+              logger.warning(
+                  f"   Max iterations reached ({MAX_FIX_ITERATIONS}) — "
+                  f"using best graph so far (score={score:.2f})"
+              )
+              break
+
+          # ── 5b: Fix ───────────────────────────────────────────────────────────
+          logger.info(f"  [5b] Fixing graph (iteration {iteration})...")
+
+          # On first iteration, if Stage 4 produced a partial graph,
+          # inject the known missing types into validation so 5b's prompt is explicit.
+          validation_for_fix = validation
+          if iteration == 1 and stage4_missing:
+              import copy
+              validation_for_fix = copy.deepcopy(validation)
+              existing_missing = validation_for_fix.get("missing_fracture_types", [])
+              merged_missing = list(dict.fromkeys(existing_missing + stage4_missing))
+              validation_for_fix["missing_fracture_types"] = merged_missing
+              # Also add as high-importance missing_scenarios so _format_issues includes them
+              existing_scenarios = validation_for_fix.get("missing_scenarios", [])
+              known_ids = {s.get("fracture_type", "") for s in existing_scenarios}
+              for ft in stage4_missing:
+                  if ft not in known_ids:
+                      existing_scenarios.append({
+                          "fracture_type": ft,
+                          "patient_params": {},
+                          "expected_action": "см. алгоритм Stage 3",
+                          "importance": "high",
+                      })
+              validation_for_fix["missing_scenarios"] = existing_scenarios
+              logger.info(
+                  f"  [5b] Injected {len(stage4_missing)} Stage-4-missing types "
+                  f"into validation for fix prompt."
+              )
+
+          fixed = _run(
+              f"stage5b_{iter_label}",
+              lambda g=current_graph, v=validation_for_fix: stages["5b"].run(
+                  g, v, text, algorithm=algorithm
+              ),
+          )
+
+          if fixed is None:
+              logger.error(f"  [5b] Fix failed at iteration {iteration} — keeping previous graph")
+              break
+
+          # Accumulate changelog from this fix iteration
+          iter_changelog = fixed.get("changelog", [])
+          for entry in iter_changelog:
+              entry.setdefault("fix_iteration", iteration)
+          accumulated_changelog.extend(iter_changelog)
+
+          # Update current graph for next iteration
+          current_graph = {
+              "nodes":     fixed.get("nodes", current_graph.get("nodes", [])),
+              "edges":     fixed.get("edges", current_graph.get("edges", [])),
+              "changelog": accumulated_changelog,
+          }
+
+          n_nodes = len(current_graph["nodes"])
+          n_edges = len(current_graph["edges"])
+          n_act   = sum(1 for n in current_graph["nodes"] if n.get("type") == "ACTION")
+          logger.info(
+              f"  [5b] Graph updated: {n_nodes} nodes ({n_act} actions), "
+              f"{n_edges} edges, {len(iter_changelog)} changelog entries"
+          )
 
     fixed_data = current_graph
     # Preserve full accumulated changelog

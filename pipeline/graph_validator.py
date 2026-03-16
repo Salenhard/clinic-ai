@@ -129,7 +129,7 @@ def validate_graph_structure(graph_doc: dict) -> list[dict]:
         nid  = n["id"]
         opts = n.get("options") or []
         out  = out_edges.get(nid, [])
-        edge_labels = {e.get("label", "").strip().lower() for e in out}
+        edge_labels = {(e.get("label") or "").strip().lower() for e in out}
         edge_values: set[str] = set()
         for e in out:
             cond = e.get("condition") or {}

@@ -100,6 +100,7 @@ _PROMPT = """\
 
 class Stage4Graph(BasePipelineStage):
     stage_name = "stage4_graph"
+    MAX_OUTPUT_TOKENS = 65536  # full graph can exceed 8192 tokens
 
     def build_prompt(
         self,
@@ -110,10 +111,20 @@ class Stage4Graph(BasePipelineStage):
         factors: dict,
     ) -> str:
         def _j(d, key, n=2500):
-            return json.dumps(d.get(key, []), ensure_ascii=False)[:n]
+            raw = json.dumps(d.get(key, []), ensure_ascii=False)[:n]
+            return raw.replace("{", "{{").replace("}", "}}")
 
+        def _safe(s: str) -> str:
+            return s.replace("{", "{{").replace("}", "}}")
+
+        alg_json = json.dumps(algorithm.get("algorithm", {}), ensure_ascii=False)
+        if len(alg_json) > 8000:
+            logger.warning(
+                f"Stage4: algorithm JSON is {len(alg_json)} chars — truncating to 8000. "
+                f"Some branches may be lost."
+            )
         return _PROMPT.format(
-            algorithm_json=json.dumps(algorithm.get("algorithm", {}), ensure_ascii=False)[:4000],
+            algorithm_json=_safe(alg_json[:8000]),
             osteosynthesis_json=_j(osteosynthesis, "osteosynthesis_methods"),
             arthroplasty_json=_j(arthroplasty, "arthroplasty_methods"),
             fracture_json=_j(fracture_treatments, "fracture_treatments"),
@@ -175,6 +186,7 @@ class Stage4Graph(BasePipelineStage):
         for e in data["edges"]:
             out_edges.setdefault(e.get("from"), []).append(e)
 
+        uncovered_total = []
         for n in data["nodes"]:
             if n.get("type") != "DECISION":
                 continue
@@ -193,8 +205,45 @@ class Stage4Graph(BasePipelineStage):
                 and o.strip().lower() not in edge_values
             ]
             if uncovered:
+                uncovered_total.extend(uncovered)
                 logger.warning(
                     f"Stage4: DECISION '{n['id']}' has uncovered options: {uncovered}"
+                )
+
+        # Check that all expected fracture types from algorithm made it into the graph.
+        # This is a WARNING, not an error — a partial graph is better than None.
+        # Missing types will be handled by Stage 5b which has the Stage 3 algorithm.
+        expected = getattr(self, "_expected_fracture_types", [])
+        if expected:
+            all_labels = set()
+            for e in data["edges"]:
+                lbl = (e.get("label") or "").strip().lower()
+                if lbl:
+                    all_labels.add(lbl)
+            for n in data["nodes"]:
+                lbl = (n.get("label") or "").strip().lower()
+                if lbl:
+                    all_labels.add(lbl)
+
+            missing_in_graph = [
+                ft for ft in expected
+                if not any(
+                    ft.strip().lower() in lbl or lbl in ft.strip().lower()
+                    for lbl in all_labels
+                )
+            ]
+            if missing_in_graph:
+                # Store on instance so main.py can log it if needed
+                self.missing_fracture_types = missing_in_graph
+                logger.warning(
+                    f"Stage4: {len(missing_in_graph)} fracture type(s) missing from graph "
+                    f"(likely hit output token limit): {missing_in_graph}. "
+                    f"Stage 5b will complete the graph."
+                )
+            else:
+                self.missing_fracture_types = []
+                logger.info(
+                    f"Stage4 coverage: all {len(expected)} fracture types present in graph"
                 )
 
         logger.info(f"Stage 4: {n_nodes} nodes ({n_actions} actions), {len(data['edges'])} edges")
@@ -208,6 +257,11 @@ class Stage4Graph(BasePipelineStage):
         fracture_treatments: dict,
         factors: dict,
     ) -> dict:
+        # Store expected fracture types for coverage check in parse_response
+        alg_branches = algorithm.get("algorithm", {}).get("branches", [])
+        root = next((b for b in alg_branches if b.get("level") == "primary"), None)
+        self._expected_fracture_types = list(root.get("options", [])) if root else []
+
         prompt = self.build_prompt(algorithm, osteosynthesis, arthroplasty,
                                     fracture_treatments, factors)
         return self._execute_with_retry(prompt)

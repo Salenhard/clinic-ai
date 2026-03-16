@@ -101,16 +101,19 @@ class Stage5aValidate(BasePipelineStage):
         fracture_treatments: dict,
         source_text: str,
     ) -> str:
+        def _safe(s: str) -> str:
+            return s.replace("{", "{{").replace("}", "}}")
+
         g = graph if "nodes" in graph else graph.get("graph", graph)
         return _PROMPT.format(
-            graph_json=json.dumps(g, ensure_ascii=False)[:12000],
-            osteosynthesis_json=json.dumps(
-                osteosynthesis.get("osteosynthesis_methods", []), ensure_ascii=False)[:2000],
-            arthroplasty_json=json.dumps(
-                arthroplasty.get("arthroplasty_methods", []), ensure_ascii=False)[:2000],
-            fracture_json=json.dumps(
-                fracture_treatments.get("fracture_treatments", []), ensure_ascii=False)[:3000],
-            source_text=source_text[:2000],
+            graph_json=_safe(json.dumps(g, ensure_ascii=False)[:12000]),
+            osteosynthesis_json=_safe(json.dumps(
+                osteosynthesis.get("osteosynthesis_methods", []), ensure_ascii=False)[:2000]),
+            arthroplasty_json=_safe(json.dumps(
+                arthroplasty.get("arthroplasty_methods", []), ensure_ascii=False)[:2000]),
+            fracture_json=_safe(json.dumps(
+                fracture_treatments.get("fracture_treatments", []), ensure_ascii=False)[:3000]),
+            source_text=_safe(source_text[:2000]),
         )
 
     def parse_response(self, response_text: str) -> dict:

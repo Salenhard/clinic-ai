@@ -49,7 +49,8 @@ class Stage1cFractureSpecific(BasePipelineStage):
     stage_name = "stage1c_fracture_specific"
 
     def build_prompt(self, text: str, chunk_idx: int = 0, total: int = 1) -> str:
-        return _PROMPT.format(text=text[:10000], chunk_idx=chunk_idx + 1, total_chunks=total)
+        safe_text = text[:10000].replace("{" , "{{").replace("}", "}}")
+        return _PROMPT.format(text=safe_text, chunk_idx=chunk_idx + 1, total_chunks=total)
 
     def parse_response(self, response_text: str) -> dict:
         data = json.loads(self._clean_json(response_text))

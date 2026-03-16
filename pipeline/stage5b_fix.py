@@ -32,6 +32,10 @@ _PROMPT = """\Задача: исправить граф принятия реш�
 ## ИСХОДНЫЙ ТЕКСТ (справочно):
 {source_text}
 
+## ОБЯЗАТЕЛЬНЫЙ КОНТРОЛЬНЫЙ СПИСОК — ВСЕ СУЩЕСТВУЮЩИЕ УЗЛЫ
+Следующие узлы ОБЯЗАНЫ присутствовать в ответе (они уже существуют, не удаляй их):
+{existing_node_ids}
+
 ## РЕЖИМ РАБОТЫ — ТОЛЬКО ДОБАВЛЕНИЕ
 
 Ты можешь ТОЛЬКО:
@@ -39,6 +43,7 @@ _PROMPT = """\Задача: исправить граф принятия реш�
 - Исправлять action_details существующих ACTION-узлов, если они указаны в issues.
 
 Ты НЕ МОЖЕШЬ:
+- Пропускать узлы из контрольного списка выше — это КРИТИЧЕСКАЯ ОШИБКА.
 - Удалять существующие узлы или рёбра, не упомянутые в issues.
 - Переименовывать существующие узлы.
 - Менять порядок факторов в поддеревьях (топология берётся из алгоритма Stage 3).
@@ -61,7 +66,7 @@ ACTION-узел описывает ОДНУ конкретную операци�
 
 ## ВЫХОДНОЙ ФОРМАТ (строго JSON)
 {{
-  "nodes": [...все узлы, включая неизменённые...],
+  "nodes": [...все узлы из контрольного списка + новые...],
   "edges": [...все рёбра, включая неизменённые...],
   "changelog": [
     {{"action": "added|modified", "element": "node|edge", "id": "...", "reason": "..."}}
@@ -359,6 +364,7 @@ def _diff_changelog(before: dict, after: dict) -> list[dict]:
 
 class Stage5bFix(BasePipelineStage):
     stage_name = "stage5b_fix"
+    MAX_OUTPUT_TOKENS = 32768  # must return all nodes+edges including unchanged ones
 
     def build_prompt(
         self,
@@ -376,15 +382,27 @@ class Stage5bFix(BasePipelineStage):
             if ms.get("importance") in ("high", "medium")
         ]
         algorithm = self._algorithm or {}
+
+        # Build explicit checklist of ALL existing node IDs to prevent LLM from dropping them
+        existing_node_ids = "\n".join(
+            f"  - {n['id']} [{n.get('type')}] {n.get('label', '')[:40]}"
+            for n in nodes
+        )
+
+        def _safe(s: str) -> str:
+            return s.replace("{", "{{").replace("}", "}}")
+
+        algorithm = self._algorithm or {}
         return _PROMPT.format(
-            algorithm_json=json.dumps(
+            algorithm_json=_safe(json.dumps(
                 algorithm.get("algorithm", algorithm),
                 ensure_ascii=False,
-            )[:3000],
-            nodes_json=json.dumps(nodes, ensure_ascii=False, indent=2)[:5000],
-            edges_json=json.dumps(edges, ensure_ascii=False, indent=2)[:3500],
+            )[:3000]),
+            existing_node_ids=existing_node_ids,
+            nodes_json=_safe(json.dumps(nodes, ensure_ascii=False, indent=2)),
+            edges_json=_safe(json.dumps(edges, ensure_ascii=False, indent=2)),
             issues_text=_format_issues(structural_issues, all_clinical),
-            source_text=source_text[:2000],
+            source_text=_safe(source_text[:2000]),
         )
 
     def parse_response(self, response_text: str) -> dict:
