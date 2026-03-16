@@ -1,3 +1,4 @@
+"""Stage 5a: Validate graph completeness against the source document."""
 import json
 import logging
 from .base import BasePipelineStage, PipelineError
@@ -5,40 +6,61 @@ from .graph_validator import validate_graph_structure as validate
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = """\
-Проверь построенный граф принятия решений на ПОЛНОТУ соответствия исходному документу.
+_SYSTEM = (
+    "Ты — эксперт-аналитик клинических рекомендаций. "
+    "Отвечай ТОЛЬКО валидным JSON без пояснений, комментариев и markdown-разметки."
+)
 
-ФИНАЛЬНЫЙ ГРАФ:
+_PROMPT = """\
+Задача: проверить, полностью ли граф принятия решений покрывает клинические сценарии \
+из исходного документа.
+
+## ВХОДНЫЕ ДАННЫЕ
+
+### Граф:
 {graph_json}
 
-ИЗВЛЕЧЁННЫЕ МЕТОДЫ ОСТЕОСИНТЕЗА:
-{osteosynthesis_json}
-
-ИЗВЛЕЧЁННЫЕ МЕТОДЫ ЭНДОПРОТЕЗИРОВАНИЯ:
-{arthroplasty_json}
-
-ЛЕЧЕНИЕ ПО ТИПАМ ПЕРЕЛОМОВ (эталон):
+### Эталон — лечение по типам переломов (из Stage 1c):
 {fracture_json}
 
-ИСХОДНЫЙ ТЕКСТ (фрагмент):
+### Методы остеосинтеза (из Stage 1a):
+{osteosynthesis_json}
+
+### Методы эндопротезирования (из Stage 1b):
+{arthroplasty_json}
+
+### Фрагмент исходного текста:
 {source_text}
 
-Проверь:
-1. Все ли типы переломов из текста представлены в графе?
-2. Все ли возрастные категории корректно обработаны?
-3. Все ли методы лечения из документа представлены в ACTION-узлах?
-4. Есть ли клинически важные ситуации, не покрытые графом?
-5. Корректны ли уровни доказательности в action_details?
-6. Нет ли схлопнутых веток — ACTION-узлов, покрывающих группу нозологий вместо одной
-   операции? (например, ACTION "Лечение Pipkin" вместо отдельных ACTION для I, II, III, IV)
-7. Нет ли одного ACTION-узла, куда ведут пути из двух разных нозологий?
-8. Минимум ACTION-узлов для полного покрытия: ≥12.
-   Если меньше — укажи как critical issue с перечнем недостающих веток.
-6. Нет ли схлопнутых веток — ACTION-узлов, покрывающих группу нозологий вместо одной
-   операции?
-7. Нет ли одного ACTION-узла, куда ведут пути из двух разных нозологий?
+## КАК ПРОВЕРЯТЬ
 
-Верни СТРОГО JSON:
+### Шаг 1 — Подсчёт ожидаемых маршрутов
+Для каждого типа перелома в fracture_json определи все уникальные комбинации
+значений факторов пациента (patient_modifications). Каждая комбинация = отдельный
+маршрут, который должен иметь свой ACTION-узел в графе.
+Ожидаемое число ACTION-узлов = сумма таких комбинаций по всем типам переломов.
+
+### Шаг 2 — Верификация каждого маршрута
+Для каждого ожидаемого маршрута (тип перелома + факторы пациента):
+1. Проследи путь START → ... → END в графе.
+2. Проверь, совпадает ли конечный ACTION с рекомендацией в fracture_json.
+3. Если путь не существует или приводит к неверному ACTION — это issue.
+
+### Шаг 3 — Флагировать ТОЛЬКО доказанные проблемы
+Проблема флагируется как issue, только если ты можешь указать конкретный маршрут
+(список узлов START → ... → END), который:
+а) не существует в графе, или
+б) существует, но конечный ACTION не соответствует рекомендации.
+Нельзя флагировать "потенциальные" или "возможные" проблемы без конкретного маршрута.
+
+### Шаг 4 — Схлопывание нозологий
+ACTION-узел считается схлопнутым, только если в граф ведут рёбра из двух разных
+нозологий (разных типов переломов или разных значений факторов). Это проверяется
+по входящим рёбрам узла, а не по названию операции. Одинаковое название операции
+для разных нозологий — НЕ схлопывание, если входящие рёбра из разных поддеревьев
+ведут в разные ACTION-узлы.
+
+## ВЫХОДНОЙ ФОРМАТ (строго JSON, без пояснений)
 {{
   "completeness_score": 0.0,
   "covered_fracture_types": [],
@@ -49,14 +71,17 @@ _PROMPT = """\
   "issues": [
     {{
       "severity": "critical | warning | info",
-      "node_id": null,
-      "description": "...",
-      "suggestion": "..."
+      "node_id": "id проблемного узла или null",
+      "path": ["start_001", "dec_fracture_type", "...", "act_X"],
+      "description": "точное описание проблемы с указанием конкретного маршрута",
+      "suggestion": "конкретное исправление"
     }}
   ],
   "missing_scenarios": [
     {{
-      "description": "...",
+      "fracture_type": "тип перелома",
+      "patient_params": {{"фактор": "значение"}},
+      "expected_action": "ожидаемый метод лечения",
       "importance": "high | medium | low"
     }}
   ],
@@ -84,7 +109,7 @@ class Stage5aValidate(BasePipelineStage):
             arthroplasty_json=json.dumps(
                 arthroplasty.get("arthroplasty_methods", []), ensure_ascii=False)[:2000],
             fracture_json=json.dumps(
-                fracture_treatments.get("fracture_treatments", []), ensure_ascii=False)[:2500],
+                fracture_treatments.get("fracture_treatments", []), ensure_ascii=False)[:3000],
             source_text=source_text[:2000],
         )
 
@@ -107,7 +132,7 @@ class Stage5aValidate(BasePipelineStage):
         fracture_treatments: dict,
         source_text: str,
     ) -> dict:
-        # Structural validation (deterministic)
+        # Structural validation (deterministic, no LLM)
         graph_doc = graph if "graph" in graph else {"graph": graph}
         structural_issues = validate(graph_doc)
 

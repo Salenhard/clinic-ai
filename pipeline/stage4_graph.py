@@ -1,67 +1,87 @@
+"""Stage 4: Generate graph JSON from algorithm structure and extracted methods."""
 import json
 import logging
 from .base import BasePipelineStage, PipelineError
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = """\
-Преобразуй структурированный алгоритм и данные о методах лечения в ГРАФ принятия решений.
+_SYSTEM = (
+    "Ты — эксперт-аналитик клинических рекомендаций. "
+    "Отвечай ТОЛЬКО валидным JSON без пояснений, комментариев и markdown-разметки."
+)
 
-АЛГОРИТМ (ветки и логика):
+_PROMPT = """\
+Задача: преобразовать алгоритм принятия решений в граф (nodes + edges).
+
+## ВХОДНЫЕ ДАННЫЕ
+
+### Алгоритм из Stage 3 (АВТОРИТЕТНЫЙ ИСТОЧНИК — строго соблюдай его структуру):
 {algorithm_json}
 
-МЕТОДЫ ОСТЕОСИНТЕЗА:
+### Методы остеосинтеза:
 {osteosynthesis_json}
 
-МЕТОДЫ ЭНДОПРОТЕЗИРОВАНИЯ:
+### Методы эндопротезирования:
 {arthroplasty_json}
 
-ЛЕЧЕНИЕ ПО ТИПАМ ПЕРЕЛОМОВ:
+### Лечение по типам переломов:
 {fracture_json}
 
-ПРОТИВОПОКАЗАНИЯ:
+### Противопоказания:
 {contraindications_json}
 
-ПРАВИЛА УЗЛОВ:
-• START  — ровно один; question=null, options=[], action_details=null
-• DECISION — question + options (≥2); action_details=null
-• ACTION — question=null, options=[]; action_details ОБЯЗАТЕЛЕН (procedure, implant, timing, notes)
-• WARNING — question=null, options=[]; идёт ДО ACTION (не после)
-• END — question=null, options=[], action_details=null
+## ПРАВИЛА УЗЛОВ
+- START  — ровно один; question=null, options=[], action_details=null
+- DECISION — question (текст вопроса) + options (≥ 2 варианта); action_details=null
+- ACTION — question=null, options=[]; action_details ОБЯЗАТЕЛЕН
+- WARNING — question=null, options=[]; ставится ДО ACTION, не после
+- END    — question=null, options=[], action_details=null
 
-ПРАВИЛА РЁБЕР:
-• START → первый DECISION (condition=null, label=null)
-• Каждый вариант из DECISION.options → РОВНО ОДНО исходящее ребро
-• label ребра ДОЛЖЕН точно совпадать с текстом варианта из options
-• Если вариант из options не имеет ребра — ОШИБКА (тупик)
-• ACTION → END (condition=null, единственное исходящее ребро)
-• WARNING → ACTION → END
-• Нет дублей (одинаковые from+to), нет самопетель, нет циклов
-• Все узлы достижимы из START
+## ПРАВИЛА РЁБЕР
+- START → первый DECISION: label=null, condition=null
+- Каждый вариант из DECISION.options → РОВНО ОДНО исходящее ребро;
+  label ребра должен точно совпадать с текстом варианта
+- ACTION → END: единственное исходящее ребро, label=null
+- Нет дублей (одинаковые from+to), нет самопетель, нет циклов
+- Все узлы достижимы из START
 
-КРИТИЧЕСКИЕ ПРАВИЛА СТРУКТУРЫ:
+## СТРОГО ЗАПРЕЩЕНО
 
-ЗАПРЕЩЕНО — объединять нозологии в один ACTION:
-   ACTION "Остеосинтез" ← и от Garden <60, и от Pipkin II <60
-   Каждая нозология × возраст × метод = ОТДЕЛЬНЫЙ ACTION-узел.
+### Запрет 1 — Схлопывание нозологий
+Один ACTION-узел НЕ МОЖЕТ принимать входящие рёбра из разных нозологий.
+Для каждой уникальной комбинации (тип перелома × факторы пациента) — отдельный ACTION.
 
-ЗАПРЕЩЕНО — пропускать ветки:
-   Если в options есть "Нестабильный" — ОБЯЗАТЕЛЬНО должно быть ребро от него.
-   Если в options есть ">= 60" — ОБЯЗАТЕЛЬНО должно быть ребро от него.
+### Запрет 2 — Пустые ветки
+Каждый вариант из DECISION.options обязан иметь исходящее ребро.
+Количество options == количество исходящих рёбер. Без исключений.
 
-СТРОГО ЗАПРЕЩЕНЫ ПАТТЕРНЫ:
-• Два ребра с одинаковым label из одного DECISION-узла
-• DECISION-узел с options где хотя бы один вариант не имеет ребра
-• ACTION-узел с несколькими входящими рёбрами из разных нозологий
+### Запрет 3 — Отклонение от алгоритма Stage 3
+Топология веток (порядок факторов, набор вариантов) определяется алгоритмом
+из Stage 3 — не изменяй её. Не переставляй факторы, не добавляй развилки,
+которых нет в алгоритме.
 
-Верни СТРОГО JSON (только nodes + edges):
+### Запрет 4 — Общий DECISION для разных нозологий
+Нельзя использовать один узел-развилку для двух разных типов переломов.
+Каждый тип перелома имеет собственные DECISION-узлы для всех последующих вопросов.
+
+## ACTION.action_details — обязательные поля
+{{
+  "procedure": "точное название операции из входных данных",
+  "implant": "имплантат из входных данных или null",
+  "timing": "срочность из входных данных или null",
+  "evidence_level": "уровень доказательности из входных данных или null",
+  "contraindications": [],
+  "notes": "примечания из входных данных или null"
+}}
+
+## ВЫХОДНОЙ ФОРМАТ (строго JSON, только nodes + edges)
 {{
   "nodes": [
     {{
-      "id": "start_001",
+      "id": "уникальный_id",
       "type": "START | DECISION | ACTION | WARNING | END",
-      "label": "...",
-      "question": "текст или null",
+      "label": "краткое название",
+      "question": "текст вопроса или null",
       "options": [],
       "action_details": null
     }}
@@ -69,9 +89,9 @@ _PROMPT = """\
   "edges": [
     {{
       "id": "edge_001",
-      "from": "...",
-      "to": "...",
-      "label": "...",
+      "from": "id узла-источника",
+      "to": "id узла-назначения",
+      "label": "текст варианта или null",
       "condition": {{"field": "...", "operator": "==", "value": "..."}}
     }}
   ]
@@ -124,10 +144,10 @@ class Stage4Graph(BasePipelineStage):
         for e in data["edges"]:
             pair = (e.get("from"), e.get("to"))
             if pair[0] == pair[1]:
-                logger.warning(f"Stage4: self-loop {e.get('id')} removed")
+                logger.warning(f"Stage4: self-loop on {pair[0]} removed")
                 continue
             if pair in seen:
-                logger.warning(f"Stage4: duplicate {pair} removed")
+                logger.warning(f"Stage4: duplicate edge {pair} removed")
                 continue
             seen.add(pair)
             clean.append(e)
@@ -137,25 +157,17 @@ class Stage4Graph(BasePipelineStage):
         n_nodes = len(data["nodes"])
         n_actions = sum(1 for n in data["nodes"] if n.get("type") == "ACTION")
 
-        # Warn if too few ACTION nodes (likely collapsed branches)
-        if n_actions < 8:
-            logger.warning(
-                f"Stage4: only {n_actions} ACTION nodes — graph likely has collapsed "
-                f"branches. Expected ≥ 12 for full Pipkin/Garden/Чрезвертельные coverage."
-            )
-
         # Detect ACTION nodes shared between multiple incoming sources (nozology collapse)
         incoming: dict[str, list[str]] = {}
         for e in data["edges"]:
-            dst = e.get("to")
-            src = e.get("from")
+            dst, src = e.get("to"), e.get("from")
             if dst and src:
                 incoming.setdefault(dst, []).append(src)
         for nid, srcs in incoming.items():
             if len(srcs) > 1 and node_type.get(nid) == "ACTION":
                 logger.warning(
                     f"Stage4: ACTION '{nid}' reached from {len(srcs)} sources {srcs} — "
-                    f"possible nozology collapse (same ACTION for different fracture types)."
+                    f"possible nozology collapse."
                 )
 
         # Check DECISION options coverage
@@ -182,8 +194,7 @@ class Stage4Graph(BasePipelineStage):
             ]
             if uncovered:
                 logger.warning(
-                    f"Stage4: DECISION '{n['id']}' has uncovered options: {uncovered} — "
-                    f"these will create dead ends."
+                    f"Stage4: DECISION '{n['id']}' has uncovered options: {uncovered}"
                 )
 
         logger.info(f"Stage 4: {n_nodes} nodes ({n_actions} actions), {len(data['edges'])} edges")

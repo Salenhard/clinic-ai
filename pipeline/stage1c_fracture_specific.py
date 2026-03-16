@@ -7,31 +7,39 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = """\
-Проанализируй разделы документа, посвящённые конкретным типам переломов.
-Для каждого типа перелома извлеки рекомендации по лечению.
+_SYSTEM = (
+    "Ты — эксперт-аналитик клинических рекомендаций. "
+    "Отвечай ТОЛЬКО валидным JSON без пояснений, комментариев и markdown-разметки."
+)
 
-ТЕКСТ (чанк {chunk_idx}/{total_chunks}):
+_PROMPT = """\
+Задача: для каждого типа перелома, упомянутого в тексте, извлечь рекомендованную тактику лечения.
+
+## ВХОДНЫЕ ДАННЫЕ
+Чанк {chunk_idx} из {total_chunks}:
 {text}
 
-Для каждого типа укажи:
-- fracture_type      : название типа перелома
-- classification     : система классификации (Pipkin/Garden/AO)
-- primary_treatment  : рекомендуемый метод (название)
-- alternative        : альтернативный метод если есть
-- age_modifications  : объект {{age_group: method}} если тактика меняется по возрасту
-- key_notes          : важные клинические примечания
+## ПРАВИЛА ИЗВЛЕЧЕНИЯ
+- Создавай запись только для типов переломов, явно упомянутых в этом чанке.
+- Название типа перелома и системы классификации бери дословно из текста.
+- Если тактика различается по какому-либо признаку пациента (возраст, активность и др.),
+  заполни поле patient_modifications: ключи — значения этого признака из текста,
+  значения — соответствующие методы лечения.
+- Не добавляй пороговые значения или названия методов, которых нет в тексте.
 
-Верни СТРОГО JSON:
+## ВЫХОДНОЙ ФОРМАТ (строго JSON, без пояснений)
 {{
   "fracture_treatments": [
     {{
-      "fracture_type": "...",
-      "classification": "...",
-      "primary_treatment": "...",
-      "alternative": null,
-      "age_modifications": {{}},
-      "key_notes": []
+      "fracture_type": "название типа перелома, как в тексте",
+      "classification": "система классификации, как в тексте",
+      "primary_treatment": "основной рекомендуемый метод",
+      "alternative": "альтернативный метод или null",
+      "patient_modifications": {{
+        "значение признака 1": "метод лечения для этой группы",
+        "значение признака 2": "метод лечения для этой группы"
+      }},
+      "key_notes": ["важное клиническое примечание из текста"]
     }}
   ]
 }}"""
@@ -60,11 +68,10 @@ class Stage1cFractureSpecific(BasePipelineStage):
                     seen.add(key)
                     merged.append(m)
                 elif key in seen:
-                    # Merge age_modifications from duplicate entries
                     for existing in merged:
                         if existing.get("fracture_type", "").strip().lower() == key:
-                            existing["age_modifications"].update(
-                                m.get("age_modifications", {})
+                            existing.setdefault("patient_modifications", {}).update(
+                                m.get("patient_modifications", {})
                             )
                             break
         return {"fracture_treatments": merged}

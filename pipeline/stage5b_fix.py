@@ -13,64 +13,62 @@ from .graph_validator import validate_graph_structure as validate
 logger = logging.getLogger(__name__)
 MAX_FIX_LOOPS = 2
 
-_PROMPT = """\
-Исправь граф принятия решений на основе отчёта о проблемах.
+_PROMPT = """\Задача: исправить граф принятия решений на основе отчёта о проблемах.
 
-РЕЖИМ РАБОТЫ — ТОЧЕЧНЫЕ ПРАВКИ:
-НЕ перестраивай граф с нуля. Вноси только минимально необходимые изменения для устранения указанных проблем.
-Сохраняй все существующие узлы и рёбра, которые не упомянуты в проблемах.
-Каждое изменение ДОЛЖНО быть отражено в changelog.
+## ЭТАЛОН — АЛГОРИТМ ИЗ STAGE 3 (авторитетный источник топологии):
+{algorithm_json}
 
-ТЕКУЩИЙ ГРАФ:
+## ТЕКУЩИЙ ГРАФ
+
 Узлы:
 {nodes_json}
 
 Рёбра:
 {edges_json}
 
-ПРОБЛЕМЫ:
+## ПРОБЛЕМЫ ДЛЯ ИСПРАВЛЕНИЯ:
 {issues_text}
 
-ИСХОДНЫЙ ТЕКСТ (справочно):
+## ИСХОДНЫЙ ТЕКСТ (справочно):
 {source_text}
 
-ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
-УЗЛЫ:
-• START: ровно один; question=null, options=[], action_details=null
-• DECISION: question + options ≥2; action_details=null
-• ACTION: question=null, options=[]; action_details обязателен
-• WARNING: идёт ДО ACTION НЕ после
-• END: question=null, options=[], action_details=null
+## РЕЖИМ РАБОТЫ — ТОЛЬКО ДОБАВЛЕНИЕ
 
-РЁБРА:
-• Каждый вариант DECISION.options → ровно одно ребро (label == вариант)
-• ACTION → END (condition=null, единственное исходящее)
-• Нет дублей, нет самопетель, нет циклов, все узлы достижимы
+Ты можешь ТОЛЬКО:
+- Добавлять недостающие узлы и рёбра для покрытия маршрутов из issues.
+- Исправлять action_details существующих ACTION-узлов, если они указаны в issues.
 
-ПАРАМЕТРЫ:
-• Параметр, нужный в нескольких ветках → один DECISION-узел в начале
-• НЕЛЬЗЯ: ребро проверяет поле, уже определённое на пути к этому узлу
-• НЕЛЬЗЯ: один DECISION-узел доступен из двух веток с разным значением одного параметра
+Ты НЕ МОЖЕШЬ:
+- Удалять существующие узлы или рёбра, не упомянутые в issues.
+- Переименовывать существующие узлы.
+- Менять порядок факторов в поддеревьях (топология берётся из алгоритма Stage 3).
+- Перестраивать граф с нуля.
 
-РАЗВОРАЧИВАНИЕ ВЕТОК — ОБЯЗАТЕЛЬНО:
-• ACTION должен описывать ОДНУ конкретную операцию, не группу ("Лечение Pipkin I-IV" — ОШИБКА)
-• Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
-• Нестабильный перелом без разделения по возрасту — ОШИБКА, добавь DECISION(возраст)
-ты можешь дополнять уже существующие графы (пример: добавить недостающие типы переломов, варианты выборов)
-• Если ACTION схлопывает несколько нозологий — замени его на DECISION + отдельные ACTION:
-  "Лечение Pipkin" → DECISION(подтип)[I,II,III,IV] → ACTION(I), ACTION(II), ACTION(III), ACTION(IV)
-• Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
+## ПРАВИЛА УЗЛОВ И РЁБЕР
+- START: ровно один; question=null, options=[], action_details=null
+- DECISION: question + options ≥ 2; action_details=null
+- ACTION: question=null, options=[]; action_details обязателен
+- WARNING: ставится ДО ACTION, не после
+- END: question=null, options=[], action_details=null
+- Каждый вариант DECISION.options → ровно одно исходящее ребро (label == вариант)
+- ACTION → END: единственное исходящее ребро
+- Нет дублей (одинаковые from+to), нет самопетель, нет циклов
 
-Верни СТРОГО JSON:
+## ПРАВИЛО ПРОТИВ СХЛОПЫВАНИЯ
+ACTION-узел описывает ОДНУ конкретную операцию для одного маршрута.
+Нельзя использовать один ACTION для двух разных нозологий
+(два входящих ребра из разных поддеревьев).
+
+## ВЫХОДНОЙ ФОРМАТ (строго JSON)
 {{
   "nodes": [...все узлы, включая неизменённые...],
   "edges": [...все рёбра, включая неизменённые...],
   "changelog": [
-    {{"action": "added|modified|removed", "element": "node|edge", "id": "...", "reason": "..."}}
+    {{"action": "added|modified", "element": "node|edge", "id": "...", "reason": "..."}}
   ]
 }}
-ВАЖНО: changelog ОБЯЗАТЕЛЕН. Пустой changelog означает что ничего не изменилось — это ошибка если проблемы были."""
-
+ВАЖНО: возвращай ВСЕ существующие узлы и рёбра, даже если они не изменялись.
+Changelog обязателен — перечисли каждое добавленное или изменённое поле."""
 
 def _format_issues(structural: list[dict], clinical: list[dict]) -> str:
     lines = []
@@ -377,15 +375,16 @@ class Stage5bFix(BasePipelineStage):
             {"severity": "info", **ms} for ms in missing_scenarios
             if ms.get("importance") in ("high", "medium")
         ]
+        algorithm = self._algorithm or {}
         return _PROMPT.format(
+            algorithm_json=json.dumps(
+                algorithm.get("algorithm", algorithm),
+                ensure_ascii=False,
+            )[:3000],
             nodes_json=json.dumps(nodes, ensure_ascii=False, indent=2)[:5000],
             edges_json=json.dumps(edges, ensure_ascii=False, indent=2)[:3500],
             issues_text=_format_issues(structural_issues, all_clinical),
             source_text=source_text[:2000],
-            algorithm_json=json.dumps(
-                self._algorithm.get("algorithm", self._algorithm) if self._algorithm else {},
-                ensure_ascii=False,
-            )[:3000],
         )
 
     def parse_response(self, response_text: str) -> dict:

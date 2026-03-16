@@ -6,54 +6,71 @@ from .base import BasePipelineStage, PipelineError
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = """\
-На основе извлечённых данных построй логическую структуру алгоритма принятия решений
-о методе лечения перелома проксимального отдела бедренной кости.
+_SYSTEM = (
+    "Ты — эксперт-аналитик клинических рекомендаций. "
+    "Отвечай ТОЛЬКО валидным JSON без пояснений, комментариев и markdown-разметки."
+)
 
-МЕТОДЫ ОСТЕОСИНТЕЗА:
+_PROMPT = """\
+Задача: построить логическую структуру алгоритма принятия клинических решений \
+на основе извлечённых данных.
+
+## ВХОДНЫЕ ДАННЫЕ
+
+### Методы остеосинтеза:
 {osteosynthesis_json}
 
-МЕТОДЫ ЭНДОПРОТЕЗИРОВАНИЯ:
+### Методы эндопротезирования:
 {arthroplasty_json}
 
-ЛЕЧЕНИЕ ПО ТИПАМ ПЕРЕЛОМОВ:
+### Лечение по типам переломов:
 {fracture_json}
 
-ФАКТОРЫ ПАЦИЕНТА:
+### Факторы пациента:
 {factors_json}
 
-Задача: определи ВСЕ РАЗВИЛКИ алгоритма и их IF-THEN-ELSE правила.
+### Фрагмент исходного текста (справочно):
+{source_text}
 
-КРИТИЧЕСКИЕ ТРЕБОВАНИЯ К СТРУКТУРЕ:
+## ПРАВИЛА ПОСТРОЕНИЯ АЛГОРИТМА
 
-ВСЕ OPTIONS ПОКРЫТЫ:
-   Каждый вариант в options → либо terminal, либо sub_branch. Без исключений.
-   Если вариант не ведёт никуда — это ОШИБКА.
+### Правило 1 — Полное покрытие вариантов
+Каждый вариант в options ОБЯЗАН приводить к результату — либо через terminals,
+либо через дочернюю ветку в sub_branches. Вариант без терминала и без
+дочерней ветки — ошибка структуры.
 
-Для каждой развилки укажи:
-- id           : уникальный идентификатор (branch_001 и т.д.)
-- question     : вопрос врачу (текст)
-- field        : fracture_type / age / stability / location / status / fixation_method
-- level        : "primary" | "secondary" | "tertiary"
-- parent_branch: id родительской ветки или null
-- options      : список вариантов (точные строки)
-- terminals    : {{вариант: метод_лечения}} для вариантов без дочерних развилок
-- sub_branches : список id дочерних развилок
+### Правило 2 — Независимость поддеревьев
+Каждый тип перелома получает своё независимое поддерево.
+Нельзя использовать одну ветку как общую для двух разных типов переломов.
+Если один и тот же фактор (например, возраст) влияет на тактику в нескольких
+типах — для каждого типа создаётся отдельная ветка с этим фактором.
 
-Верни СТРОГО JSON:
+### Правило 3 — Порядок факторов внутри поддерева
+Порядок факторов определяется данными:
+- Первым ставь тот фактор, который сильнее всего разветвляет тактику
+  (после него наибольшее число вариантов приходит к терминалу).
+- Фактор ставится только там, где он реально влияет на тактику — не выноси
+  его выше, если он нужен лишь в части веток.
+- Порядок факторов определяется логикой документа, а не общими предположениями.
+
+### Правило 4 — Точность данных
+Названия типов переломов, факторов, вариантов и методов лечения берутся
+дословно из входных данных. Не придумывай термины, отсутствующие в данных.
+
+## ВЫХОДНОЙ ФОРМАТ (строго JSON, без пояснений)
 {{
   "algorithm": {{
-    "entry_question": "текст первого вопроса",
+    "entry_question": "текст первого вопроса врачу",
     "branches": [
       {{
         "id": "branch_001",
-        "question": "...",
-        "field": "...",
-        "level": "primary",
+        "question": "вопрос врачу",
+        "field": "название поля (fracture_type / age / stability / location / status / ...)",
+        "level": "primary | secondary | tertiary",
         "parent_branch": null,
-        "options": [],
-        "terminals": {{}},
-        "sub_branches": []
+        "options": ["вариант 1", "вариант 2"],
+        "terminals": {{"вариант без дочерней ветки": "метод лечения"}},
+        "sub_branches": ["branch_002"]
       }}
     ]
   }}
@@ -79,7 +96,7 @@ class Stage3Algorithm(BasePipelineStage):
             arthroplasty_json=_trim(arthroplasty, "arthroplasty_methods"),
             fracture_json=_trim(fracture_treatments, "fracture_treatments"),
             factors_json=_trim(factors, "patient_factors"),
-            source_text=source_text[:2500] if source_text else "не предоставлен",
+            source_text=source_text[:8000] if source_text else "не предоставлен",
         )
 
     def parse_response(self, response_text: str) -> dict:
@@ -99,12 +116,6 @@ class Stage3Algorithm(BasePipelineStage):
             opts = b.get("options", [])
             terminals = b.get("terminals", {})
             sub_branches = b.get("sub_branches", [])
-            covered = set(terminals.keys()) | set()
-            for sb in sub_branches:
-                # Find which option leads to this sub-branch
-                for opt in opts:
-                    pass  # sub_branches don't specify which option; just check they exist
-            # Check sub_branch ids exist
             for sb_id in sub_branches:
                 if sb_id not in branch_ids:
                     issues.append(f"branch '{b['id']}': sub_branch '{sb_id}' not found")
