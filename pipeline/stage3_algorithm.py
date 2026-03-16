@@ -66,7 +66,7 @@ _PROMPT = """\
 Ключ в terminals — это ТОЧНАЯ КОПИЯ одного из вариантов из options этой же ветки.
 Нельзя создавать ключ с дополнительными словами или уточнениями.
 
-ОШИБКА:  options=["Pipkin II"],  terminals={"Pipkin II (моложе 60 лет)": "..."}
+ОШИБКА:  options=["Pipkin II"],  terminals={{"Pipkin II (моложе 60 лет)": "..."}}
 ПРАВИЛЬНО: options=["Pipkin II"], sub_branches=["branch_pipkin_ii_age"]
            И отдельная ветка branch_pipkin_ii_age с options=["моложе 60 лет", "старше 60 лет"]
 
