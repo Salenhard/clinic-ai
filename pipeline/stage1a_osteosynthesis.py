@@ -7,7 +7,7 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM = "Ты — эксперт-травматолог. Отвечай ТОЛЬКО валидным JSON без пояснений и markdown."
+_SYSTEM = "Ты — анализатор текста. Отвечай ТОЛЬКО валидным JSON без пояснений и markdown."
 
 _PROMPT = """\
 Проанализируй текст клинических рекомендаций по переломам проксимального отдела бедренной кости.
@@ -20,11 +20,9 @@ _PROMPT = """\
 - name          : полное название метода
 - fixation_type : "динамическая" | "статическая" | "комбинированная"
 - age_range     : "< 60" | ">= 60" | "универсально" | список если несколько
-- fracture_types: список типов переломов (Pipkin I, Garden I-II, 31A1.3 и т.д.)
+- fracture_types: список типов переломов
 - implant       : название имплантата/инструментария
 - key_features  : список ключевых технических характеристик
-- evidence_level: уровень доказательности если указан, иначе null
-- contraindications: список противопоказаний
 
 Верни СТРОГО JSON:
 {{
@@ -36,8 +34,6 @@ _PROMPT = """\
       "fracture_types": [],
       "implant": "...",
       "key_features": [],
-      "evidence_level": null,
-      "contraindications": []
     }}
   ]
 }}"""

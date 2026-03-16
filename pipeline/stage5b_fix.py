@@ -34,7 +34,7 @@ _PROMPT = """\
 • START: ровно один; question=null, options=[], action_details=null
 • DECISION: question + options ≥2; action_details=null
 • ACTION: question=null, options=[]; action_details обязателен
-• WARNING: идёт ДО ACTION (DECISION → WARNING → ACTION → END), НЕ после
+• WARNING: идёт ДО ACTION НЕ после
 • END: question=null, options=[], action_details=null
 
 РЁБРА:
@@ -49,24 +49,19 @@ _PROMPT = """\
 
 РАЗВОРАЧИВАНИЕ ВЕТОК — ОБЯЗАТЕЛЬНО:
 • ACTION должен описывать ОДНУ конкретную операцию, не группу ("Лечение Pipkin I-IV" — ОШИБКА)
+• Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
+• Нестабильный перелом без разделения по возрасту — ОШИБКА, добавь DECISION(возраст)
+ты можешь дополнять уже существующие графы (пример: добавить недостающие типы переломов, варианты выборов)
 • Если ACTION схлопывает несколько нозологий — замени его на DECISION + отдельные ACTION:
   "Лечение Pipkin" → DECISION(подтип)[I,II,III,IV] → ACTION(I), ACTION(II), ACTION(III), ACTION(IV)
 • Нельзя один ACTION-узел использовать для двух разных нозологий (разные incoming из разных веток)
-• Нестабильный перелом без разделения по возрасту — ОШИБКА, добавь DECISION(возраст)
 
 МИНИМУМ ACTION-узлов для полного покрытия:
   Pipkin: ≥5, Garden: ≥4, Чрезвертельные: ≥3. Итого ≥12.
-
-Новые id: node_fix_NNN / edge_fix_NNN
-Сохрани существующие id без изменений.
-
 Верни СТРОГО JSON:
 {{
   "nodes": [...],
   "edges": [...],
-  "changelog": [
-    {{"action": "added|modified|removed", "element": "node|edge", "id": "...", "reason": "..."}}
-  ]
 }}"""
 
 
@@ -93,8 +88,9 @@ def _format_issues(structural: list[dict], clinical: list[dict]) -> str:
 
 
 
-def _remove_unreachable(data: dict, accumulated_changelog: list) -> dict:
+def _remove_unreachable(data: dict, accumulated_changelog: list | None = None) -> dict:
     """Remove nodes that are not reachable from START (deterministic, no LLM)."""
+    from collections import deque
     nodes = data.get("nodes", [])
     edges = data.get("edges", [])
 
@@ -126,10 +122,6 @@ def _remove_unreachable(data: dict, accumulated_changelog: list) -> dict:
 
     for uid in unreachable:
         logger.warning(f"post_process: removing unreachable node '{uid}'")
-        accumulated_changelog.append({
-            "action": "removed", "element": "node", "id": uid,
-            "reason": f"Детерминистическое удаление: узел недостижим из START",
-        })
 
     data["nodes"] = [n for n in nodes if n["id"] not in unreachable]
     data["edges"] = [
@@ -163,8 +155,45 @@ def _post_process(data: dict) -> dict:
         clean.append(e)
     data["edges"] = clean
 
-    # Ensure END exists
+    # ── Fix duplicate labels from same DECISION node ──────────────────────────
+    # If two edges leave the same node with the same label → they were meant for
+    # different branches but got merged. Keep only the first, log a warning.
+    from collections import defaultdict
+    label_map: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for e in data["edges"]:
+        src = e.get("from", "")
+        lbl = (e.get("label") or "").strip().lower()
+        if lbl and node_type.get(src) == "DECISION":
+            label_map[src][lbl].append(e)
+
+    edges_to_remove: set[str] = set()
+    for src, lbl_edges in label_map.items():
+        for lbl, elist in lbl_edges.items():
+            if len(elist) > 1:
+                logger.warning(
+                    f"_post_process: DECISION '{src}' has {len(elist)} edges with "
+                    f"label '{lbl}' — keeping first, removing duplicates"
+                )
+                for dup in elist[1:]:
+                    edges_to_remove.add(dup.get("id", ""))
+
+    if edges_to_remove:
+        data["edges"] = [e for e in data["edges"] if e.get("id") not in edges_to_remove]
+
+    # ── Fix DECISION options with no outgoing edge (dead-end options) ─────────
+    # For every DECISION that has an option with no matching outgoing edge,
+    # insert a placeholder ACTION node + edge so the graph stays traversable.
+    out_map: dict[str, list[dict]] = defaultdict(list)
+    for e in data["edges"]:
+        out_map[e.get("from", "")].append(e)
+
+    counter_fix = sum(1 for e in data["edges"]
+                      if e.get("id", "").startswith("edge_post_fix_")) + 1
+    counter_node = sum(1 for n in nodes
+                       if n.get("id", "").startswith("node_missing_")) + 1
+
     end_nodes = [n["id"] for n in nodes if n.get("type") == "END"]
+    # Ensure END exists before we reference it
     if not end_nodes:
         end_id = "node_end"
         nodes.append({
@@ -173,26 +202,84 @@ def _post_process(data: dict) -> dict:
         })
         node_type[end_id] = "END"
         end_nodes = [end_id]
-
     global_end = end_nodes[0]
+
+    for n in nodes:
+        if n.get("type") != "DECISION":
+            continue
+        nid = n["id"]
+        options = n.get("options") or []
+        out_edges = out_map.get(nid, [])
+        out_labels = {(e.get("label") or "").strip().lower() for e in out_edges}
+        out_values = set()
+        for e in out_edges:
+            cond = e.get("condition") or {}
+            v = cond.get("value")
+            if v:
+                out_values.add(str(v).strip().lower())
+
+        for opt in options:
+            opt_lower = opt.strip().lower()
+            if opt_lower in out_labels or opt_lower in out_values:
+                continue
+            # Option has no outgoing edge — create placeholder ACTION + edges
+            node_id = f"node_missing_{counter_node:03d}"
+            edge_to_id = f"edge_post_fix_{counter_fix:03d}"
+            edge_end_id = f"edge_post_fix_{counter_fix + 1:03d}"
+            counter_node += 1
+            counter_fix += 2
+
+            logger.warning(
+                f"_post_process: DECISION '{nid}' option '{opt}' has no outgoing edge "
+                f"— inserting placeholder ACTION '{node_id}'"
+            )
+            nodes.append({
+                "id": node_id,
+                "type": "ACTION",
+                "label": f"[Требует уточнения] {opt}",
+                "question": None,
+                "options": [],
+                "action_details": {
+                    "procedure": f"Требует уточнения для варианта: {opt}",
+                    "implant": None,
+                    "timing": None,
+                    "evidence_level": None,
+                    "contraindications": [],
+                    "notes": "Автоматически добавлено — необходимо уточнить тактику",
+                },
+            })
+            node_type[node_id] = "ACTION"
+            data["edges"].append({
+                "id": edge_to_id,
+                "from": nid, "to": node_id,
+                "label": opt, "condition": None,
+            })
+            data["edges"].append({
+                "id": edge_end_id,
+                "from": node_id, "to": global_end,
+                "label": None, "condition": None,
+            })
+            out_map[nid].append(data["edges"][-2])
+
+    # Ensure END exists (re-check after possible additions above)
+    end_nodes = [n["id"] for n in nodes if n.get("type") == "END"]
+    global_end = end_nodes[0]
+
+    # Add → END for ACTION/WARNING nodes that lack it
     has_end_edge = {e["from"] for e in data["edges"] if node_type.get(e.get("to")) == "END"}
-    counter = sum(1 for e in data["edges"]
-                  if e.get("id", "").startswith("edge_post_fix_")) + 1
+    counter_end = sum(1 for e in data["edges"]
+                      if e.get("id", "").startswith("edge_post_fix_")) + 1
 
     for n in nodes:
         nid, ntype = n["id"], n.get("type")
         if ntype in ("ACTION", "WARNING") and nid not in has_end_edge:
-            eid = f"edge_post_fix_{counter:03d}"
-            counter += 1
+            eid = f"edge_post_fix_{counter_end:03d}"
+            counter_end += 1
             data["edges"].append({
                 "id": eid, "from": nid, "to": global_end,
-                "label": "Завершение ветки", "condition": None,
+                "label": None, "condition": None,
             })
             has_end_edge.add(nid)
-            data.setdefault("changelog", []).append({
-                "action": "added", "element": "edge", "id": eid,
-                "reason": f"Автоисправление: {ntype} '{nid}' не имел ребра к END",
-            })
 
     data["nodes"] = nodes
     return data
@@ -249,8 +336,6 @@ class Stage5bFix(BasePipelineStage):
         if "graph" in current:
             current = current["graph"]
 
-        accumulated_changelog: list[dict] = []
-
         for loop in range(MAX_FIX_LOOPS):
             graph_doc = {"graph": current}
             structural = validate(graph_doc)
@@ -271,15 +356,15 @@ class Stage5bFix(BasePipelineStage):
             )
             fixed = self._execute_with_retry(prompt)
             fixed = _post_process(fixed)
-            accumulated_changelog.extend(fixed.get("changelog", []))
             current = {"nodes": fixed["nodes"], "edges": fixed["edges"]}
 
+        # Deterministic: remove unreachable nodes
+        current = _remove_unreachable(current)
+
         # Final deterministic pass
-        final = _post_process({"nodes": current["nodes"], "edges": current["edges"], "changelog": []})
-        accumulated_changelog.extend(final.get("changelog", []))
+        final = _post_process({"nodes": current["nodes"], "edges": current["edges"]})
 
         return {
             "nodes": final["nodes"],
             "edges": final["edges"],
-            "changelog": accumulated_changelog,
         }

@@ -20,7 +20,6 @@ _PROMPT = """\
 - special_features : особые конструктивные особенности (двойная мобильность и т.д.)
 - advantages       : преимущества
 - limitations      : ограничения
-- evidence_level   : уровень доказательности если указан, иначе null
 - fracture_types   : при каких типах переломов применяется
 
 Верни СТРОГО JSON:
@@ -33,7 +32,6 @@ _PROMPT = """\
       "special_features": [],
       "advantages": [],
       "limitations": [],
-      "evidence_level": null,
       "fracture_types": []
     }}
   ]

@@ -7,7 +7,7 @@ from .chunker import Chunk
 from typing import List
 
 logger = logging.getLogger(__name__)
-
+"""парсить картинки, описать механизм верификации(алгоритм авто проверки 2-ая llm 5%)"""
 _PROMPT = """\
 Проанализируй текст клинических рекомендаций. Извлеки ВСЕ факторы и критерии принятия решений.
 
@@ -26,9 +26,6 @@ _PROMPT = """\
 3. decision_criteria — технические и анатомические критерии:
    Поля: name, method, value_or_rule (измеримый критерий: "TAD < 25 мм" и т.д.), importance
 
-4. contraindications — противопоказания к методам:
-   Поля: method_name, absolute (список), relative (список), risk_factors (список)
-
 Верни СТРОГО JSON:
 {{
   "patient_factors": [
@@ -45,7 +42,6 @@ _PROMPT = """\
       "type_label": "...",
       "description": "...",
       "stability": "стабильный | нестабильный | не определено",
-      "risks": [],
       "recommended_method": "..."
     }}
   ],
@@ -55,14 +51,6 @@ _PROMPT = """\
       "method": "...",
       "value_or_rule": "...",
       "importance": "обязательно | рекомендуется"
-    }}
-  ],
-  "contraindications": [
-    {{
-      "method_name": "...",
-      "absolute": [],
-      "relative": [],
-      "risk_factors": []
     }}
   ]
 }}"""

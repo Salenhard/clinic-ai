@@ -105,6 +105,57 @@ class BasePipelineStage(ABC):
 
         return response.text
 
+    def _call_llm_multimodal(
+        self,
+        contents: list,
+        system: str | None = None,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Call Gemini with multimodal content (text + images).
+
+        Parameters
+        ----------
+        contents : list of genai_types.Part objects (images + text)
+        system   : system instruction override
+        """
+        import time
+        self._limiter.acquire()
+
+        sys_instr = system if system else self._SYSTEM_INSTRUCTION
+        config = genai_types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=max_tokens,
+            system_instruction=sys_instr,
+        )
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "429" in exc_str or "resource_exhausted" in exc_str or "quota" in exc_str:
+                logger.warning(
+                    f"{self.stage_name}: quota exceeded — "
+                    f"backing off {self.RATE_LIMIT_BACKOFF}s ..."
+                )
+                time.sleep(self.RATE_LIMIT_BACKOFF)
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=config,
+                )
+            else:
+                raise
+
+        meta = getattr(response, "usage_metadata", None)
+        if meta:
+            self.tokens_used += getattr(meta, "prompt_token_count", 0)
+            self.tokens_used += getattr(meta, "candidates_token_count", 0)
+
+        return response.text
+
     # ── JSON repair ───────────────────────────────────────────────────────────
 
     def _repair_json(self, broken_text: str) -> dict:

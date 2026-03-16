@@ -14,16 +14,12 @@ _PROMPT = """\
 ТЕКСТ (чанк {chunk_idx}/{total_chunks}):
 {text}
 
-Типы переломов для поиска: Pipkin I, Pipkin II, Pipkin III, Pipkin IV,
-Garden I-II, Garden III-IV, 31A1.3, 31A2, подвертельные, другие.
-
 Для каждого типа укажи:
 - fracture_type      : название типа перелома
 - classification     : система классификации (Pipkin/Garden/AO)
 - primary_treatment  : рекомендуемый метод (название)
 - alternative        : альтернативный метод если есть
 - age_modifications  : объект {{age_group: method}} если тактика меняется по возрасту
-- evidence_level     : уровень доказательности если указан
 - key_notes          : важные клинические примечания
 
 Верни СТРОГО JSON:
@@ -35,7 +31,6 @@ Garden I-II, Garden III-IV, 31A1.3, 31A2, подвертельные, други
       "primary_treatment": "...",
       "alternative": null,
       "age_modifications": {{}},
-      "evidence_level": null,
       "key_notes": []
     }}
   ]

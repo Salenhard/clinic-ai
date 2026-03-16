@@ -1,12 +1,3 @@
-"""Stage 5a: Validate graph completeness against the source document.
-
-Checks:
-- All fracture types covered
-- All age categories handled
-- All treatment methods represented
-- Technical requirements met
-Returns a completeness report + structural validation results.
-"""
 import json
 import logging
 from .base import BasePipelineStage, PipelineError
@@ -33,8 +24,8 @@ _PROMPT = """\
 {source_text}
 
 Проверь:
-1. Все ли типы переломов (Pipkin I-IV, Garden I-IV, 31A1.3, 31A2 и др.) представлены в графе?
-2. Все ли возрастные категории (<60, >=60, >=70) корректно обработаны?
+1. Все ли типы переломов из текста представлены в графе?
+2. Все ли возрастные категории корректно обработаны?
 3. Все ли методы лечения из документа представлены в ACTION-узлах?
 4. Есть ли клинически важные ситуации, не покрытые графом?
 5. Корректны ли уровни доказательности в action_details?
@@ -43,6 +34,9 @@ _PROMPT = """\
 7. Нет ли одного ACTION-узла, куда ведут пути из двух разных нозологий?
 8. Минимум ACTION-узлов для полного покрытия: ≥12.
    Если меньше — укажи как critical issue с перечнем недостающих веток.
+6. Нет ли схлопнутых веток — ACTION-узлов, покрывающих группу нозологий вместо одной
+   операции?
+7. Нет ли одного ACTION-узла, куда ведут пути из двух разных нозологий?
 
 Верни СТРОГО JSON:
 {{
