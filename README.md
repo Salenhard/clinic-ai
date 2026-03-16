@@ -69,17 +69,6 @@ docker compose run --rm clinical-graph-builder \
 
 Результаты появятся в `data/output/graph.json` и `data/output/metrics.json`.
 
-```bash
-# Запуск с подробным логом
-make run-verbose
-
-# Повторный запуск без повторного обращения к API (используется кэш стадий)
-make run-cached
-
-# Консоль внутри контейнера
-make shell
-```
-
 ---
 
 ## Установка без Docker
@@ -97,13 +86,12 @@ python main.py \
   --input  data/input/guidelines.pdf \
   --output data/output/graph.json \
   --metrics data/output/metrics_v2.json \
-  --topic "clinical guidelines" \
-  --section "переломы шейки бедра" \
   --model gemini-3.1-flash-lite-preview \
   --rpm 15 \
   --cache-dir data/cache \
   --use-cache \
-  --verbose
+  --verbose \
+  --max-fix-iterations 5
 ```
 
 ### Все параметры CLI
@@ -157,10 +145,7 @@ USE_CACHE=                # любое непустое значение = вк�
 
 | Модель | RPM (free) | Качество | Рекомендация |
 |---|---|---|---|
-| `gemini-2.0-flash` | 15 | ★★★★ | По умолчанию |
-| `gemini-2.0-flash-lite` | 30 | ★★★ | При нехватке квоты |
 | `gemini-3.1-flash-lite-preview` | 30 | ★★★ | При нехватке квоты |
-| `gemini-1.5-pro` | 2 | ★★★★★ | Для сложных документов |
 
 ---
 
