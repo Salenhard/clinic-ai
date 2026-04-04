@@ -1,227 +1,326 @@
 # Clinical Graph Builder
 
-Программа для извлечения клинических алгоритмов принятия решений из PDF-рекомендаций
-с помощью каскадных запросов к Claude API.
+Инструмент для автоматического извлечения клинических графов принятия решений из PDF-документов с медицинскими рекомендациями. На входе — PDF, на выходе — валидированный JSON-граф, пригодный для интеграции в медицинские системы поддержки принятия решений.
 
-## Запуск через Docker (рекомендуется)
+## Содержание
 
-### Быстрый старт
+- [Обзор](#обзор)
+- [Архитектура](#архитектура)
+- [Быстрый старт](#быстрый-старт)
+- [Установка без Docker](#установка-без-docker)
+- [Конфигурация](#конфигурация)
+- [Формат выходного графа](#формат-выходного-графа)
+- [Валидатор графа](#валидатор-графа)
+- [Сравнение версий pipeline](#сравнение-версий-pipeline)
+- [Структура проекта](#структура-проекта)
+- [Известные ограничения](#известные-ограничения)
+
+---
+
+## Обзор
+
+Приложение использует каскад LLM-промптов на базе Google Gemini для поэтапного извлечения и структурирования клинических алгоритмов. Каждый этап специализируется на одном аспекте (методы, факторы, логика, граф), что позволяет обрабатывать большие документы через разбивку на чанки и переиспользовать результаты отдельных стадий через кэш.
+
+**Пример задачи:** клинические рекомендации по переломам проксимального отдела бедренной кости (Pipkin I-IV, Garden I-IV, 31A) → граф с 13–15 клиническими маршрутами.
+
+---
+
+## Архитектура
+
+### Pipeline — 5 этапов, 8 стадий
+
+Предметно-ориентированный каскад: каждый этап Этапа 1 извлекает отдельный класс данных, Этап 3 строит логический алгоритм перед генерацией графа.
+
+```
+Stage 1a  Методы остеосинтеза        (chunk-aware)
+Stage 1b  Методы эндопротезирования  (chunk-aware)
+Stage 1c  Тактика по типам переломов (chunk-aware)
+Stage 2   Факторы и классификации    (chunk-aware)
+Stage 3   Структура алгоритма        (IF-THEN логика, уровни вложенности)
+Stage 4   Генерация графа JSON
+Stage 5a  Валидация полноты
+Stage 5b  Исправление графа          (validate → fix, до 2 итераций)
+          → Финальная структурная валидация
+```
+
+**Рекомендуемая температура:** `0.1` — оптимальный баланс между детерминизмом и полнотой (при `0.0` модель склонна оставлять незакрытые ветки и недостижимые узлы).
+
+---
+
+## Быстрый старт
+
+### Docker (рекомендуется)
 
 ```bash
-# 1. Скопируйте шаблон окружения и укажите API-ключ
+# 1. Скопировать конфиг
 cp .env.example .env
-echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
+# Вписать GEMINI_API_KEY в .env
 
-# 2. Положите PDF в ./data/input/
-mkdir -p data/input data/output data/cache
-cp /path/to/guidelines.pdf data/input/
+# 2. Положить PDF
+cp guidelines.pdf data/input/
 
-# 3. Соберите образ
-docker compose build
-# или: make build
-
-# 4. Запустите
+# 3. Собрать и запустить
 docker compose run --rm clinical-graph-builder \
   --input  /data/input/guidelines.pdf \
   --output /data/output/graph.json \
   --metrics /data/output/metrics.json \
-  --section "переломы шейки бедра" \
-  --verbose
-
-# Результаты появятся в ./data/output/
+  --max-fix-iterations 5
 ```
 
-### Через Makefile (удобные сокращения)
-
-```bash
-make build        # собрать образ
-make run          # запустить с настройками из .env
-make run-verbose  # то же, но с подробным логом
-make run-cached   # повторный запуск без повторного извлечения (быстро)
-make shell        # bash внутри контейнера для отладки
-make clean        # удалить образ и кэш
-```
-
-### Через docker run (без Compose)
-
-```bash
-docker run --rm \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  -v $(pwd)/data/input:/data/input:ro \
-  -v $(pwd)/data/output:/data/output \
-  -v $(pwd)/data/cache:/app/pipeline_cache \
-  clinical-graph-builder:latest \
-  --input  /data/input/guidelines.pdf \
-  --output /data/output/graph.json \
-  --metrics /data/output/metrics.json \
-  --section "переломы шейки бедра" \
-  --verbose
-```
-
-### Переменные окружения (.env)
-
-| Переменная | Обязательна | Описание |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | ✅ | Ключ Claude API |
-| `INPUT_FILE` | — | Имя PDF внутри `./data/input/` (default: `guidelines.pdf`) |
-| `OUTPUT_FILE` | — | Имя выходного JSON (default: `graph.json`) |
-| `METRICS_FILE` | — | Имя файла метрик (default: `metrics.json`) |
-| `MODEL` | — | Claude модель (default: `claude-sonnet-4-20250514`) |
-| `SECTION` | — | Раздел для фокусировки (пусто = весь документ) |
-| `VERBOSE` | — | Любое значение включает `--verbose` |
-| `USE_CACHE` | — | Любое значение включает `--use-cache` |
-
-### Монтируемые тома
-
-```
-./data/input/   → /data/input   (read-only)   — входные PDF
-./data/output/  → /data/output               — graph.json, metrics.json
-./data/cache/   → /app/pipeline_cache        — промежуточные этапы
-```
-
-Кэш `./data/cache/` сохраняется между запусками. При `--use-cache` пропускаются уже завершённые этапы — удобно при отладке или повторной обработке того же документа.
+Результаты появятся в `data/output/graph.json` и `data/output/metrics.json`.
 
 ---
 
-## Локальная установка (без Docker)
+## Установка без Docker
+
+**Требования:** Python 3.12+
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY="your_api_key_here"
 ```
 
-### Базовый запуск
-```bash
-python main.py --input guidelines.pdf --output graph.json
-```
+### Pipeline
 
-### С указанием раздела и метриками
 ```bash
 python main.py \
-  --input guidelines.pdf \
-  --output graph.json \
-  --metrics metrics.json \
-  --section "переломы шейки бедра" \
-  --verbose
+  --input  data/input/guidelines.pdf \
+  --output data/output/graph.json \
+  --metrics data/output/metrics_v2.json \
+  --model gemini-3.1-flash-lite-preview \
+  --rpm 15 \
+  --cache-dir data/cache \
+  --use-cache \
+  --verbose \
+  --max-fix-iterations 5
 ```
 
-### С использованием кэша (для повторных запусков)
-```bash
-python main.py --input guidelines.pdf --use-cache
+### Все параметры CLI
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `--input` | — | Путь к входному PDF (обязательный) |
+| `--output` | — | Путь к выходному JSON графа (обязательный) |
+| `--metrics` | `metrics.json` / `metrics_v2.json` | Путь к файлу метрик |
+| `--section` | `""` | Подсказка для фокусировки на нужном разделе PDF |
+| `--topic` | `"clinical guidelines"` | Метка темы в metadata графа (v2) |
+| `--model` | `gemini-3.1-flash-lite-preview` | Имя модели Gemini |
+| `--rpm` | `15` | Ограничение запросов в минуту |
+| `--chunk-size` | `12000` | Максимум символов в одном чанке |
+| `--overlap` | `400` | Перекрытие между соседними чанками (символов) |
+| `--cache-dir` | `data/cache` | Директория кэша стадий |
+| `--use-cache` | `False` | Загружать результаты стадий из кэша |
+| `--api-key` | `$GEMINI_API_KEY` | API ключ (иначе из переменной окружения) |
+| `--verbose` | `False` | Подробное логирование (уровень DEBUG) |
+
+---
+
+## Конфигурация
+
+Скопируйте `.env.example` в `.env` и заполните:
+
+```dotenv
+# Обязательно
+GEMINI_API_KEY=AIza...
+
+# Модель и квота
+MODEL=gemini-3.1-flash-lite   # free tier: 15 RPM
+RPM=15
+
+# Разбивка документа
+CHUNK_SIZE=12000          # ~3000 токенов — безопасно для всех моделей Gemini
+OVERLAP=400               # перекрытие для сохранения контекста на границах
+
+# Файлы
+INPUT_FILE=guidelines.pdf
+OUTPUT_FILE=graph.json
+METRICS_FILE=metrics.json
+
+# Опционально
+SECTION=                  # например: "переломы шейки бедра"
+VERBOSE=                  # любое непустое значение = включить
+USE_CACHE=                # любое непустое значение = включить
 ```
 
-### Все параметры
-```
---input, -i      Путь к входному PDF (обязательно)
---output, -o     Путь к выходному JSON-графу (default: graph.json)
---metrics, -m    Путь к файлу метрик (default: metrics.json)
---section, -s    Раздел документа для фокусировки (опционально)
---model          Claude модель (default: claude-sonnet-4-20250514)
---verbose, -v    Подробный лог
---use-cache      Использовать кэш из pipeline_cache/
-```
+**Выбор модели:**
 
-## Архитектура каскада
+| Модель | RPM (free) | Качество | Рекомендация |
+|---|---|---|---|
+| `gemini-3.1-flash-lite-preview` | 30 | ★★★ | При нехватке квоты |
 
-```
-PDF → text extraction
-         │
-    Stage 1: Entity Extraction      → pipeline_cache/stage1_entities.json
-         │
-    Stage 2: Rule Extraction        → pipeline_cache/stage2_rules.json
-         │
-    Stage 3: Node Construction      → pipeline_cache/stage3_nodes.json
-         │
-    Stage 4: Edge Construction      → pipeline_cache/stage4_edges.json
-         │
-    Stage 5: Assembly & Enrichment  → pipeline_cache/stage5_assembly.json
-         │
-    Stage 6: Clinical Verification  → pipeline_cache/stage6_verify.json
-         │
-    graph.json + metrics.json
-```
+---
 
-## Выходной формат (graph.json)
+## Формат выходного графа
 
 ```json
 {
   "metadata": {
     "source_document": "guidelines.pdf",
-    "created_at": "2025-01-01T00:00:00+00:00",
-    "version": "1.0",
-    "topic": "переломы шейки бедра"
+    "created_at": "2026-03-07T19:00:09Z",
+    "version": "1.1",
+    "topic": "clinical guidelines",
+    "pipeline_version": "v2"
   },
   "graph": {
     "nodes": [
       {
-        "id": "node_001",
-        "type": "START | DECISION | ACTION | WARNING | END",
-        "label": "...",
-        "question": "...",
+        "id": "start_001",
+        "type": "START",
+        "label": "Начало алгоритма",
+        "question": null,
+        "options": [],
+        "action_details": null
+      },
+      {
+        "id": "dec_fracture_type",
+        "type": "DECISION",
+        "label": "Тип перелома",
+        "question": "Выберите тип перелома:",
+        "options": ["Pipkin", "Garden I-II", "31A1.3/31A2"],
+        "action_details": null
+      },
+      {
+        "id": "act_pipkin_i",
+        "type": "ACTION",
+        "label": "Удаление фрагмента",
+        "question": null,
         "options": [],
         "action_details": {
-          "procedure": "...",
-          "implant": "...",
-          "timing": "...",
-          "evidence_level": "1A",
-          "contraindications": [],
-          "notes": "..."
+          "procedure": "Удаление фрагмента головки БК",
+          "implant": null,
+          "timing": "Срочно",
+          "evidence_level": "C",
+          "contraindications": ["Нестабильность"],
+          "notes": "Pipkin I"
         }
+      },
+      {
+        "id": "end_001",
+        "type": "END",
+        "label": "Конец",
+        "question": null,
+        "options": [],
+        "action_details": null
       }
     ],
     "edges": [
       {
         "id": "edge_001",
-        "from": "node_001",
-        "to": "node_002",
-        "label": "Возраст < 60 лет",
+        "from": "start_001",
+        "to": "dec_fracture_type",
+        "label": null,
+        "condition": null
+      },
+      {
+        "id": "edge_002",
+        "from": "dec_fracture_type",
+        "to": "act_pipkin_i",
+        "label": "Pipkin I",
         "condition": {
-          "field": "age",
-          "operator": "<",
-          "value": "60"
+          "field": "fracture_type",
+          "operator": "==",
+          "value": "Pipkin I"
         }
       }
     ]
-  }
+  },
+  "changelog": [
+    {
+      "action": "added",
+      "element": "node",
+      "id": "end_001",
+      "reason": "Автоисправление: добавлен узел END"
+    }
+  ]
 }
 ```
+
+### Типы узлов
+
+| Тип | `question` | `options` | `action_details` | Описание |
+|---|---|---|---|---|
+| `START` | `null` | `[]` | `null` | Ровно один, точка входа |
+| `DECISION` | текст | ≥ 2 варианта | `null` | Развилка — вопрос врачу |
+| `ACTION` | `null` | `[]` | обязателен | Конкретная операция / назначение |
+| `WARNING` | `null` | `[]` | обязателен | Предупреждение о противопоказаниях; стоит **до** ACTION |
+| `END` | `null` | `[]` | `null` | Конец маршрута (может быть несколько) |
+
+---
+
+## Валидатор графа
+
+`pipeline/graph_validator.py` выполняет **15 детерминированных проверок** без обращения к LLM:
+
+| # | Проверка |
+|---|---|
+| 1 | Ровно один START-узел |
+| 2 | Хотя бы один END-узел |
+| 3 | START без question/options/action_details |
+| 4 | Каждый DECISION имеет question + ≥ 2 options |
+| 5 | Каждый ACTION имеет action_details |
+| 6 | Нет дублирующих рёбер (одинаковые from+to) |
+| 7 | Нет самопетель |
+| 8 | Все узлы из рёбер существуют в nodes |
+| 9 | Каждый вариант DECISION.options покрыт исходящим ребром |
+| 10 | Каждый ACTION/WARNING имеет ребро к END; ACTION ведёт **только** к END |
+| 11 | Нет недостижимых узлов из START |
+| 12 | Нет циклов (DAG-проверка обходом в глубину) |
+| 13 | Число исходящих рёбер DECISION ≤ len(options) + 1 |
+| 14 | Одно поле не проверяется дважды на одном пути START→END |
+| 15 | Ребро не проверяет поле, уже определённое на пути к его источнику |
+
+Запуск отдельно:
+
+```python
+from pipeline.graph_validator import validate
+import json
+
+graph = json.load(open("graph.json"))
+issues = validate(graph)
+for issue in issues:
+    print(f"[{issue['severity'].upper()}] {issue['description']}")
+    print(f"  → {issue['suggestion']}")
+```
+
+---
 
 ## Структура проекта
 
 ```
 clinical_graph_builder/
-├── Dockerfile               # Multi-stage сборка (builder + runtime)
-├── docker-compose.yml       # Compose с volume-маппингом и .env
-├── .env.example             # Шаблон переменных окружения
-├── .dockerignore
-├── Makefile                 # Удобные сокращения (build/run/shell/clean)
-├── main.py                  # CLI точка входа
+│
+├── main.py                      
 ├── requirements.txt
-├── data/                    # (создаётся локально, не в репо)
-│   ├── input/               # Входные PDF
-│   ├── output/              # graph.json, metrics.json
-│   └── cache/               # Кэш промежуточных этапов
-├── pipeline/
-│   ├── __init__.py
-│   ├── base.py              # Базовый класс с retry и JSON repair
-│   ├── stage1_entities.py   # Извлечение сущностей
-│   ├── stage2_rules.py      # Извлечение правил
-│   ├── stage3_nodes.py      # Построение узлов
-│   ├── stage4_edges.py      # Построение рёбер
-│   ├── stage5_assembly.py   # Финальная сборка
-│   └── stage6_verify.py     # Клиническая верификация
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── .dockerignore
+├── Makefile
+│
+│
+├── pipeline/                 
+│   ├── base.py                  
+│   ├── rate_limiter.py
+│   ├── chunker.py
+│   ├── graph_validator.py
+│   ├── stage1a_osteosynthesis.py
+│   ├── stage1b_arthroplasty.py
+│   ├── stage1c_fracture_specific.py
+│   ├── stage2_factors.py
+│   ├── stage3_algorithm.py
+│   ├── stage4_graph.py
+│   ├── stage5a_validate.py
+│   └── stage5b_fix.py
+│
 ├── metrics/
-│   ├── __init__.py
-│   └── graph_metrics.py     # Метрики через networkx
-└── schemas/
-    └── graph_schema.json    # JSON Schema для валидации
+│   └── graph_metrics.py
+│
+├── schemas/
+│   └── graph_schema.json        # JSON Schema для валидации выходного графа
+│
+└── data/
+    ├── input/                   # Входные PDF (монтируется в Docker read-only)
+    ├── output/                  # Выходные JSON графы и метрики
+    └── cache/                   # Кэш результатов отдельных стадий
 ```
 
-## Метрики
-
-Программа автоматически рассчитывает:
-- **Структурные**: число узлов, рёбер, глубина, ветвление
-- **Связность**: связен ли граф, изолированные узлы, циклы
-- **Полнота**: покрытие правил из текста, наличие уровней доказательности
-- **LLM**: потраченные токены, завершённые этапы
-- **Клинические**: оценка точности, пропущенные сценарии
+---

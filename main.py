@@ -1,550 +1,667 @@
 #!/usr/bin/env python3
 """
-Clinical Graph Builder — Main Entry Point
-==========================================
-Extracts clinical decision graphs from PDF guidelines
-using a cascaded LLM pipeline (Claude API).
+clinical_graph_builder v2 — 5-stage cascade pipeline.
 
-Usage:
-    python main.py --input guidelines.pdf --output graph.json \
-        --metrics metrics.json --section "переломы шейки бедра" --verbose
+Stage flow:
+  1a  Extract osteosynthesis methods   (chunk-aware)
+  1b  Extract arthroplasty methods     (chunk-aware)
+  1c  Extract fracture treatments      (chunk-aware)
+  2   Extract decision factors         (chunk-aware)
+  3   Build algorithm structure        (single LLM call)
+  4   Generate graph JSON              (single LLM call)
+  5a  Validate completeness + structure
+  5b  Fix graph (validate→fix loop)    (up to 2 LLM calls)
+  ──  Final structural validation
+  ──  Assemble output JSON
 """
 import argparse
 import json
 import logging
-import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-
-import anthropic
-
-from pipeline import (
-    PipelineError,
-    Stage1Entities,
-    Stage2Rules,
-    Stage3Nodes,
-    Stage4Edges,
-    Stage5Assembly,
-    Stage6Verify,
-)
-from metrics import compute_graph_metrics
-
-# ── Optional dependencies ────────────────────────────────────────────────────
-try:
-    import jsonschema
-    HAS_JSONSCHEMA = True
-except ImportError:
-    HAS_JSONSCHEMA = False
 
 try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich import box
-    HAS_RICH = True
-    console = Console()
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
-    HAS_RICH = False
-    console = None
+    print("ERROR: google-genai not installed. Run: pip install google-genai>=1.0.0")
+    sys.exit(1)
 
 try:
     import pdfplumber
-    HAS_PDFPLUMBER = True
 except ImportError:
-    HAS_PDFPLUMBER = False
+    pdfplumber = None
 
 try:
-    import pypdf
-    HAS_PYPDF = True
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.table import Table
+    HAS_RICH = True
 except ImportError:
-    HAS_PYPDF = False
+    HAS_RICH = False
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-def setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+from pipeline import (
+    PipelineError,
+    Stage0Images, Stage1aOsteosynthesis,
+    Stage1bArthroplasty,
+    Stage1cFractureSpecific,
+    Stage2Factors, Stage3Algorithm, Stage4Graph,
+    Stage5aValidate, Stage5bFix,
+    validate_graph_structure, configure_limiter,
+)
+from pipeline.chunker import TextChunker
+from pipeline.pdf_images import extract_page_images
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("main_v2")
 
 
-# ── PDF extraction ────────────────────────────────────────────────────────────
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from PDF using pdfplumber or pypdf."""
-    if HAS_PDFPLUMBER:
+# ── PDF extraction ─────────────────────────────────────────────────────────────
+
+def extract_pdf_text(path: str, section_hint: str = "") -> str:
+    if pdfplumber is None:
+        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
+    text_parts = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+    full = "\n\n".join(text_parts)
+    if section_hint:
+        low = full.lower()
+        hint = section_hint.lower()
+        idx = low.find(hint)
+        if idx != -1:
+            start = max(0, idx - 200)
+            return full[start:start + 60000]
+    return full[:80000]
+
+
+# ── Cache helpers ──────────────────────────────────────────────────────────────
+
+def _cache_path(cache_dir: str, stage_name: str) -> Path:
+    return Path(cache_dir) / f"{stage_name}.json"
+
+
+def load_cache(cache_dir: str, stage_name: str):
+    p = _cache_path(cache_dir, stage_name)
+    if p.exists():
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                pages = [page.extract_text() or "" for page in pdf.pages]
-            text = "\n\n".join(pages)
-            logging.getLogger(__name__).info(
-                f"pdfplumber extracted {len(text)} chars from {len(pages)} pages"
-            )
-            return text
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"pdfplumber failed: {e}, trying pypdf")
-
-    if HAS_PYPDF:
-        try:
-            reader = pypdf.PdfReader(pdf_path)
-            pages = [page.extract_text() or "" for page in reader.pages]
-            text = "\n\n".join(pages)
-            logging.getLogger(__name__).info(
-                f"pypdf extracted {len(text)} chars from {len(pages)} pages"
-            )
-            return text
-        except Exception as e:
-            raise RuntimeError(f"PDF extraction failed: {e}") from e
-
-    raise RuntimeError(
-        "No PDF library available. Install: pip install pdfplumber pypdf"
-    )
-
-
-def filter_section(text: str, section: Optional[str]) -> str:
-    """Optionally narrow text to relevant section."""
-    if not section:
-        return text
-
-    lower = text.lower()
-    section_lower = section.lower()
-    idx = lower.find(section_lower)
-    if idx == -1:
-        logging.getLogger(__name__).warning(
-            f"Section '{section}' not found in document — using full text"
-        )
-        return text
-
-    # Take from section start ~15000 chars
-    return text[idx: idx + 15000]
-
-
-# ── Cache helpers ─────────────────────────────────────────────────────────────
-CACHE_DIR = Path("pipeline_cache")
-
-
-def save_cache(stage: str, data: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    path = CACHE_DIR / f"{stage}.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logging.getLogger(__name__).debug(f"Cached {stage} → {path}")
-
-
-def load_cache(stage: str) -> Optional[dict]:
-    path = CACHE_DIR / f"{stage}.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     return None
 
 
-# ── Schema validation ─────────────────────────────────────────────────────────
-def validate_graph(graph: dict) -> list:
-    """Validate against JSON schema; return list of error strings."""
-    if not HAS_JSONSCHEMA:
-        return []
-    schema_path = Path(__file__).parent / "schemas" / "graph_schema.json"
-    if not schema_path.exists():
-        return []
-    schema = json.loads(schema_path.read_text())
-    errors = []
-    validator = jsonschema.Draft7Validator(schema)
-    for err in validator.iter_errors(graph):
-        errors.append(f"{list(err.path)}: {err.message}")
-    return errors
+def save_cache(cache_dir: str, stage_name: str, data: dict):
+    p = _cache_path(cache_dir, stage_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ── Console output ────────────────────────────────────────────────────────────
-def _print_plain(metrics: dict, verification: dict, output_path: str, metrics_path: str,
-                  stages_total: int, failed: list) -> None:
-    print("\n" + "=" * 55)
-    print("   CLINICAL GRAPH BUILDER — REPORT")
-    print("=" * 55)
+# ── Stage runner ───────────────────────────────────────────────────────────────
 
-    completed = metrics.get("cascade_stages_completed", 0)
-    print(f"\n🔗 Stages completed: {completed}/{stages_total}")
-    if failed:
-        print(f"   ⚠  Failed: {', '.join(failed)}")
-
-    print("\nGRAPH STRUCTURE")
-    print(f"  Nodes total:        {metrics['node_count']}")
-    print(f"  ├─ DECISION:        {metrics['decision_nodes']}")
-    print(f"  ├─ ACTION:          {metrics['action_nodes']}")
-    print(f"  ├─ WARNING:         {metrics.get('warning_nodes', 0)}")
-    print(f"  └─ END:             {metrics['terminal_nodes']}")
-    print(f"  Edges total:        {metrics['edge_count']}")
-
-    print("\nCONNECTIVITY")
-    connected = metrics.get("is_connected")
-    if connected is None:
-        print("  ⚪ Connectivity check skipped (networkx unavailable)")
-    elif connected:
-        print("  ✅ Graph is connected")
-    else:
-        print("  ❌ Graph is NOT connected")
-
-    isolated = metrics.get("isolated_nodes", [])
-    print(f"  Isolated nodes:     {len(isolated)}" + (f"  {isolated}" if isolated else ""))
-
-    has_cycles = metrics.get("has_cycles")
-    if has_cycles is None:
-        print("  ⚪ Cycle check skipped")
-    elif has_cycles:
-        print("  ❌ Cycles detected!")
-    else:
-        print("  ✅ No cycles detected")
-
-    print(f"  Max depth:          {metrics.get('max_depth', 'N/A')}")
-    print(f"  Avg branching:      {metrics.get('avg_branching_factor', 'N/A')}")
-
-    print("\nCOMPLETENESS")
-    print(f"  Entities found:     {metrics['entities_extracted']}")
-    print(f"  Rules extracted:    {metrics['rules_extracted']}")
-    rmap = metrics['rules_mapped_to_nodes']
-    rtot = metrics['rules_extracted']
-    pct = f"({metrics['extraction_completeness']*100:.1f}%)" if rtot else ""
-    print(f"  Rules in graph:     {rmap}  {pct}")
-    ae = metrics['action_nodes_with_evidence']
-    at = metrics['action_nodes']
-    epct = f"({ae/at*100:.1f}%)" if at else ""
-    print(f"  Actions with evidence: {ae}/{at}  {epct}")
-    print(f"  Total tokens used:  {metrics['total_tokens_used']:,}")
-
-    if verification:
-        score = verification.get("clinical_accuracy_score", "N/A")
-        issues = verification.get("issues", [])
-        print("\nCLINICAL VALIDATION")
-        print(f"  Accuracy score:   {score}")
-        print(f"  Issues found:     {len(issues)}")
-        for iss in issues[:5]:
-            sev = "⚠" if iss.get("severity") != "critical" else "❌"
-            print(f"    {sev} {iss.get('description', '')}")
-        missing = verification.get("missing_scenarios", [])
-        if missing:
-            print(f"  Missing scenarios: {len(missing)}")
-            for ms in missing[:3]:
-                print(f"    • {ms.get('description', '')}")
-
-    print(f"\n💾 Output saved: {output_path}")
-    print(f"📊 Metrics saved: {metrics_path}")
-    print("=" * 55)
+def run_stage(name: str, fn, cache_dir: str, use_cache: bool,
+              failed_stages: list, stages_completed_ref: list):
+    """Run a stage with cache support and error handling. Returns result or None."""
+    if use_cache:
+        cached = load_cache(cache_dir, name)
+        if cached:
+            logger.info(f"  {name}: loaded from cache")
+            return cached
+    try:
+        result = fn()
+        save_cache(cache_dir, name, result)
+        stages_completed_ref.append(name)
+        return result
+    except PipelineError as e:
+        logger.error(f"  {name} FAILED: {e}")
+        failed_stages.append(name)
+        return None
+    except Exception as e:
+        logger.error(f"  {name} unexpected error: {e}", exc_info=True)
+        failed_stages.append(name)
+        return None
 
 
-def _print_rich(metrics: dict, verification: dict, output_path: str, metrics_path: str,
-                stages_total: int, failed: list, source: str) -> None:
-    completed = metrics.get("cascade_stages_completed", 0)
+# ── Output assembly ────────────────────────────────────────────────────────────
 
-    # Header panel
-    console.print(Panel.fit(
-        f"[bold cyan]CLINICAL GRAPH BUILDER[/bold cyan]\n"
-        f"[dim]📄 Source: {source}[/dim]\n"
-        f"[dim]🔗 Stages completed: {completed}/{stages_total}[/dim]"
-        + (f"\n[red]⚠  Failed: {', '.join(failed)}[/red]" if failed else ""),
-        border_style="cyan"
-    ))
-
-    # Structure table
-    t = Table(title="Graph Structure", box=box.SIMPLE)
-    t.add_column("Type", style="bold")
-    t.add_column("Count", justify="right")
-    t.add_row("DECISION", str(metrics["decision_nodes"]))
-    t.add_row("ACTION", str(metrics["action_nodes"]))
-    t.add_row("WARNING", str(metrics.get("warning_nodes", 0)))
-    t.add_row("END", str(metrics["terminal_nodes"]))
-    t.add_row("[bold]TOTAL NODES[/bold]", f"[bold]{metrics['node_count']}[/bold]")
-    t.add_row("[bold]TOTAL EDGES[/bold]", f"[bold]{metrics['edge_count']}[/bold]")
-    console.print(t)
-
-    # Connectivity
-    conn = metrics.get("is_connected")
-    if conn is None:
-        console.print("[dim]⚪ Connectivity check skipped[/dim]")
-    elif conn:
-        console.print("[green]✅ Graph is connected[/green]")
-    else:
-        console.print("[red]❌ Graph is NOT connected[/red]")
-
-    hc = metrics.get("has_cycles")
-    if hc is None:
-        pass
-    elif hc:
-        console.print("[red]❌ Cycles detected![/red]")
-    else:
-        console.print("[green]✅ No cycles detected[/green]")
-
-    console.print(
-        f"  Max depth: [cyan]{metrics.get('max_depth', 'N/A')}[/cyan]  "
-        f"Avg branching: [cyan]{metrics.get('avg_branching_factor', 'N/A')}[/cyan]"
-    )
-
-    # Completeness table
-    t2 = Table(title="Completeness", box=box.SIMPLE)
-    t2.add_column("Metric")
-    t2.add_column("Value", justify="right")
-    t2.add_row("Entities extracted", str(metrics["entities_extracted"]))
-    t2.add_row("Rules extracted", str(metrics["rules_extracted"]))
-    pct = f"{metrics['extraction_completeness']*100:.1f}%" if metrics["rules_extracted"] else "N/A"
-    t2.add_row("Rules → graph", f"{metrics['rules_mapped_to_nodes']}  ({pct})")
-    ae = metrics["action_nodes_with_evidence"]
-    at = metrics["action_nodes"]
-    epct = f"{ae/at*100:.1f}%" if at else "N/A"
-    t2.add_row("Actions w/ evidence", f"{ae}/{at}  ({epct})")
-    t2.add_row("Tokens used", f"{metrics['total_tokens_used']:,}")
-    console.print(t2)
-
-    # Clinical validation
-    if verification:
-        score = verification.get("clinical_accuracy_score", "N/A")
-        issues = verification.get("issues", [])
-        console.print(f"\n[bold]Clinical Validation[/bold]  Accuracy: [cyan]{score}[/cyan]")
-        for iss in issues[:5]:
-            color = "red" if iss.get("severity") == "critical" else "yellow"
-            console.print(f"  [{color}]⚠[/{color}] {iss.get('description', '')}")
-        missing = verification.get("missing_scenarios", [])
-        if missing:
-            console.print(f"  [dim]Missing scenarios: {len(missing)}[/dim]")
-            for ms in missing[:3]:
-                console.print(f"  [dim]• {ms.get('description', '')}[/dim]")
-
-    console.print(f"\n[green]💾 Output saved:[/green] {output_path}")
-    console.print(f"[green]📊 Metrics saved:[/green] {metrics_path}")
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(
-    input_pdf: str,
-    output_path: str,
-    metrics_path: str,
-    section: Optional[str],
-    model: str,
-    verbose: bool,
-    use_cache: bool,
-) -> None:
-    logger = logging.getLogger(__name__)
-    start_time = time.time()
-
-    # Init Anthropic client
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY environment variable not set")
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Init stages
-    stages = {
-        "stage1": Stage1Entities(client, model),
-        "stage2": Stage2Rules(client, model),
-        "stage3": Stage3Nodes(client, model),
-        "stage4": Stage4Edges(client, model),
-        "stage5": Stage5Assembly(client, model),
-        "stage6": Stage6Verify(client, model),
+def assemble_output(
+    graph_data: dict,
+    source_path: str,
+    topic: str,
+    changelog: list,
+) -> dict:
+    """Wrap graph in the canonical output schema."""
+    nodes = graph_data.get("nodes", [])
+    edges = graph_data.get("edges", [])
+    return {
+        "metadata": {
+            "source_document": Path(source_path).name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "version": "1.0",
+            "topic": topic or "clinical guidelines",
+            "pipeline_version": "v2",
+        },
+        "graph": {
+            "nodes": nodes,
+            "edges": edges,
+        },
+        "changelog": changelog,
     }
 
-    failed_stages = []
-    stages_completed = 0
-    verification_result = {}
 
-    # ── Extract PDF text ──────────────────────────────────────────────────────
-    logger.info(f"Extracting text from: {input_pdf}")
-    full_text = extract_text_from_pdf(input_pdf)
-    text = filter_section(full_text, section)
-    logger.info(f"Text length: {len(text)} chars")
+# ── Report ─────────────────────────────────────────────────────────────────────
 
-    # ── Stage 1: Entities ─────────────────────────────────────────────────────
-    logger.info("── Stage 1: Entity extraction")
-    cached = load_cache("stage1_entities") if use_cache else None
-    if cached:
-        entities = cached
-        logger.info("  (loaded from cache)")
+def print_report(
+    output_path: str,
+    metrics_path: str,
+    stages_completed: list,
+    failed_stages: list,
+    final_graph: dict,
+    validation: dict,
+    structural_issues: list,
+):
+    n_nodes = len(final_graph.get("graph", {}).get("nodes", []))
+    n_edges = len(final_graph.get("graph", {}).get("edges", []))
+    n_actions = sum(
+        1 for n in final_graph.get("graph", {}).get("nodes", [])
+        if n.get("type") == "ACTION"
+    )
+    completeness = validation.get("completeness_score", "N/A") if validation else "N/A"
+    s_crits = sum(1 for i in structural_issues if i["severity"] == "critical")
+    s_warns = sum(1 for i in structural_issues if i["severity"] == "warning")
+
+    if HAS_RICH:
+        console = Console()
+        console.print("\n[bold cyan]═══ РЕЗУЛЬТАТ (pipeline v2) ═══[/bold cyan]")
+        t = Table(show_header=False, box=None, padding=(0, 2))
+        t.add_row("Стадий выполнено", f"[green]{len(stages_completed)}/8[/green]")
+        if failed_stages:
+            t.add_row("Ошибки стадий", f"[red]{', '.join(failed_stages)}[/red]")
+        t.add_row("Узлов в графе", str(n_nodes))
+        t.add_row("Рёбер в графе", str(n_edges))
+        t.add_row("ACTION-узлов (маршрутов)", str(n_actions))
+        t.add_row("Полнота (LLM оценка)", str(completeness))
+        t.add_row(
+            "Структурная валидация",
+            f"[red]{s_crits} critical[/red], [yellow]{s_warns} warning[/yellow]"
+            if (s_crits or s_warns) else "[green]✅ Валиден[/green]"
+        )
+        console.print(t)
+        if validation:
+            miss = validation.get("missing_fracture_types", [])
+            if miss:
+                console.print(f"[yellow]Непокрытые типы переломов: {miss}[/yellow]")
+            comment = validation.get("overall_comment", "")
+            if comment:
+                console.print(f"[dim]{comment[:200]}[/dim]")
+        console.print(f"\n[green]Output:[/green]  {output_path}")
+        console.print(f"[green]Metrics:[/green] {metrics_path}")
     else:
-        try:
-            entities = stages["stage1"].run(text, section)
-            save_cache("stage1_entities", entities)
-            stages_completed += 1
-        except PipelineError as e:
-            logger.error(f"Stage 1 failed: {e}")
-            failed_stages.append("stage1")
-            entities = {"entities": []}
+        print(f"\n{'='*55}")
+        print(f"Pipeline v2 — РЕЗУЛЬТАТ")
+        print(f"  Стадий: {len(stages_completed)}/8  |  Ошибок: {len(failed_stages)}")
+        print(f"  Узлов: {n_nodes}  |  Рёбер: {n_edges}  |  Маршрутов: {n_actions}")
+        print(f"  Полнота: {completeness}")
+        print(f"  Структура: {s_crits} critical, {s_warns} warning")
+        print(f"  Output:  {output_path}")
+        print(f"  Metrics: {metrics_path}")
+        print("=" * 55)
 
-    # ── Stage 2: Rules ────────────────────────────────────────────────────────
-    logger.info("── Stage 2: Rule extraction")
-    cached = load_cache("stage2_rules") if use_cache else None
-    if cached:
-        rules = cached
-        logger.info("  (loaded from cache)")
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Clinical Graph Builder v2 — 5-stage cascade pipeline"
+    )
+    parser.add_argument("--input",    required=True,  help="Input PDF path")
+    parser.add_argument("--output",   required=True,  help="Output JSON path")
+    parser.add_argument("--metrics",  default="metrics_v2.json", help="Metrics JSON path")
+    parser.add_argument("--section",  default="",     help="Section hint for PDF extraction")
+    parser.add_argument("--topic",    default="clinical guidelines", help="Graph topic label")
+    parser.add_argument("--model",    default="gemini-3.1-flash-lite-preview", help="Gemini model name")
+    parser.add_argument("--rpm",      type=int, default=15, help="Requests per minute limit")
+    parser.add_argument("--chunk-size", type=int, default=12000)
+    parser.add_argument("--overlap",    type=int, default=400)
+    parser.add_argument("--cache-dir",  default="data/cache_v2")
+    parser.add_argument("--use-cache",  action="store_true")
+    parser.add_argument("--api-key",    default=None)
+    parser.add_argument("--verbose",    action="store_true")
+    parser.add_argument("--images",     action="store_true", default=False,
+                        help="Enable Stage 0: analyse PDF page images via Gemini vision")
+    parser.add_argument("--image-resolution", type=int, default=150,
+                        help="DPI for PDF page rendering (default: 150)")
+    parser.add_argument("--image-max-pages", type=int, default=60,
+                        help="Maximum pages to render for vision analysis (default: 60)")
+    parser.add_argument("--max-fix-iterations", type=int, default=3,
+                        help="Max validate→fix loop iterations for Stage 5a/5b (default: 3)")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # API key
+    import os
+    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("ERROR: GEMINI_API_KEY not set")
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    configure_limiter(args.rpm)
+
+    stage_kwargs = dict(model=args.model, requests_per_minute=args.rpm)
+    stages = {
+        "0":  Stage0Images(client, **stage_kwargs),
+        "1a": Stage1aOsteosynthesis(client, **stage_kwargs),
+        "1b": Stage1bArthroplasty(client, **stage_kwargs),
+        "1c": Stage1cFractureSpecific(client, **stage_kwargs),
+        "2":  Stage2Factors(client, **stage_kwargs),
+        "3":  Stage3Algorithm(client, **stage_kwargs),
+        "4":  Stage4Graph(client, **stage_kwargs),
+        "5a": Stage5aValidate(client, **stage_kwargs),
+        "5b": Stage5bFix(client, **stage_kwargs),
+    }
+
+    stages_completed: list = []
+    failed_stages: list = []
+    metrics: dict = {"started_at": datetime.now(timezone.utc).isoformat()}
+
+    def _run(name, fn):
+        return run_stage(name, fn, args.cache_dir, args.use_cache,
+                         failed_stages, stages_completed)
+
+    # ── Extract text ──────────────────────────────────────────────────────────
+    logger.info("Extracting PDF text...")
+    text = extract_pdf_text(args.input, args.section)
+    logger.info(f"  Extracted {len(text):,} characters")
+
+    chunker = TextChunker(max_chars=args.chunk_size, overlap_chars=args.overlap)
+    chunks = chunker.split(text)
+    logger.info(f"  Split into {len(chunks)} chunks")
+
+    # ── Stage 0: Vision analysis of PDF pages (optional) ────────────────────
+    image_findings: dict = {
+        "fracture_types": [], "treatment_methods": [],
+        "decision_rules": [], "thresholds": [],
+        "warnings": [], "flowchart_paths": [], "pages_analyzed": [],
+    }
+    if args.images:
+        logger.info("Stage 0: Extracting page images from PDF...")
+        try:
+            pages = extract_page_images(
+                args.input,
+                resolution=args.image_resolution,
+                max_pages=args.image_max_pages,
+                skip_text_only=True,
+            )
+            metrics["stage0_pages_found"] = len(pages)
+            logger.info(f"  Found {len(pages)} visual pages to analyse")
+
+            if pages:
+                image_findings = _run(
+                    "stage0",
+                    lambda: stages["0"].run(pages),
+                ) or image_findings
+                metrics["stage0_methods_found"] = len(
+                    image_findings.get("treatment_methods", [])
+                )
+                metrics["stage0_flowchart_paths"] = len(
+                    image_findings.get("flowchart_paths", [])
+                )
+                logger.info(
+                    f"  Stage 0: {metrics['stage0_methods_found']} methods, "
+                    f"{metrics['stage0_flowchart_paths']} flowchart paths from images"
+                )
+            else:
+                logger.info("  Stage 0: no visual pages found — skipping vision")
+        except Exception as e:
+            logger.warning(f"Stage 0 failed (non-fatal): {e}")
     else:
-        try:
-            rules = stages["stage2"].run(text, entities)
-            save_cache("stage2_rules", rules)
-            stages_completed += 1
-        except PipelineError as e:
-            logger.error(f"Stage 2 failed: {e}")
-            failed_stages.append("stage2")
-            rules = {"rules": []}
+        logger.info("Stage 0: image analysis disabled (use --images to enable)")
+        metrics["stage0_pages_found"] = 0
 
-    # ── Stage 3: Nodes ────────────────────────────────────────────────────────
-    logger.info("── Stage 3: Node construction")
-    cached = load_cache("stage3_nodes") if use_cache else None
-    if cached:
-        nodes = cached
-        logger.info("  (loaded from cache)")
-    else:
-        try:
-            nodes = stages["stage3"].run(rules)
-            save_cache("stage3_nodes", nodes)
-            stages_completed += 1
-        except PipelineError as e:
-            logger.error(f"Stage 3 failed: {e}")
-            failed_stages.append("stage3")
-            nodes = {"nodes": []}
+    # ── Stages 1a / 1b / 1c (parallel) ──────────────────────────────────────
+    logger.info("Stages 1a/1b/1c: Extracting methods in parallel...")
+    import concurrent.futures
 
-    # ── Stage 4: Edges ────────────────────────────────────────────────────────
-    logger.info("── Stage 4: Edge construction")
-    cached = load_cache("stage4_edges") if use_cache else None
-    if cached:
-        edges = cached
-        logger.info("  (loaded from cache)")
-    else:
-        try:
-            edges = stages["stage4"].run(nodes)
-            save_cache("stage4_edges", edges)
-            stages_completed += 1
-        except PipelineError as e:
-            logger.error(f"Stage 4 failed: {e}")
-            failed_stages.append("stage4")
-            edges = {"edges": []}
+    def _run_1a(): return _run("stage1a", lambda: stages["1a"].run(chunks))
+    def _run_1b(): return _run("stage1b", lambda: stages["1b"].run(chunks))
+    def _run_1c(): return _run("stage1c", lambda: stages["1c"].run(chunks))
 
-    # ── Stage 5: Assembly ─────────────────────────────────────────────────────
-    logger.info("── Stage 5: Final assembly & enrichment")
-    cached = load_cache("stage5_assembly") if use_cache else None
-    if cached:
-        enriched = cached
-        logger.info("  (loaded from cache)")
-    else:
-        try:
-            enriched = stages["stage5"].run(nodes, edges, text)
-            save_cache("stage5_assembly", enriched)
-            stages_completed += 1
-        except PipelineError as e:
-            logger.error(f"Stage 5 failed: {e}")
-            failed_stages.append("stage5")
-            enriched = {"enriched_nodes": nodes.get("nodes", [])}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        fut_1a = executor.submit(_run_1a)
+        fut_1b = executor.submit(_run_1b)
+        fut_1c = executor.submit(_run_1c)
+        osteosynthesis      = fut_1a.result() or {"osteosynthesis_methods": []}
+        arthroplasty        = fut_1b.result() or {"arthroplasty_methods": []}
+        fracture_treatments = fut_1c.result() or {"fracture_treatments": []}
 
-    # Build final graph structure
-    final_graph = stages["stage5"].assemble_final_graph(
-        enriched_nodes=enriched.get("enriched_nodes", nodes.get("nodes", [])),
-        edges=edges.get("edges", []),
-        source_document=Path(input_pdf).name,
-        topic=section or "clinical guidelines",
+    # Merge image-extracted treatment methods into stage 1a/1b results
+    if image_findings.get("treatment_methods"):
+        img_methods = image_findings["treatment_methods"]
+        # Partition: osteosynthesis vs arthroplasty vs fracture-specific
+        for m in img_methods:
+            method_name = m.get("method", "").lower()
+            implant = m.get("implant", "") or ""
+            if any(kw in method_name or kw in implant.lower()
+                   for kw in ("эндопротез", "тэтс", "гемиэндо", "артропласт")):
+                arthroplasty.setdefault("arthroplasty_methods", []).append({
+                    "method": m.get("method"), "implant": m.get("implant"),
+                    "indication": m.get("indication"), "timing": m.get("timing"),
+                    "evidence_level": m.get("evidence_level"),
+                    "source": "image",
+                })
+            else:
+                osteosynthesis.setdefault("osteosynthesis_methods", []).append({
+                    "method": m.get("method"), "implant": m.get("implant"),
+                    "indication": m.get("indication"), "timing": m.get("timing"),
+                    "evidence_level": m.get("evidence_level"),
+                    "source": "image",
+                })
+        logger.info(
+            f"  Merged {len(img_methods)} image-extracted methods into stages 1a/1b"
+        )
+
+    # Append image-found flowchart paths to fracture treatments as extra context
+    if image_findings.get("flowchart_paths"):
+        fracture_treatments.setdefault("flowchart_paths_from_images", []).extend(
+            image_findings["flowchart_paths"]
+        )
+        logger.info(
+            f"  Merged {len(image_findings['flowchart_paths'])} "
+            f"flowchart paths from images into fracture_treatments"
+        )
+
+
+    metrics["stage1a_methods"]   = len(osteosynthesis.get("osteosynthesis_methods", []))
+    metrics["stage1b_methods"]   = len(arthroplasty.get("arthroplasty_methods", []))
+    metrics["stage1c_fractures"] = len(fracture_treatments.get("fracture_treatments", []))
+    logger.info(
+        f"  1a={metrics['stage1a_methods']} osteosynthesis, "
+        f"1b={metrics['stage1b_methods']} arthroplasty, "
+        f"1c={metrics['stage1c_fractures']} fracture treatments"
     )
 
-    # ── Schema validation ──────────────────────────────────────────────────────
-    schema_errors = validate_graph(final_graph)
-    if schema_errors:
-        logger.warning(f"Schema validation errors ({len(schema_errors)}):")
-        for err in schema_errors[:5]:
-            logger.warning(f"  {err}")
+    # ── Stage 2 ───────────────────────────────────────────────────────────────
+    logger.info("Stage 2: Extracting decision factors...")
+    factors = _run("stage2", lambda: stages["2"].run(chunks)) or {
+        "patient_factors": [], "fracture_classifications": [],
+        "decision_criteria": [], "contraindications": [],
+    }
 
-    # ── Stage 6: Verification ─────────────────────────────────────────────────
-    logger.info("── Stage 6: Clinical verification")
-    try:
-        verification_result = stages["stage6"].run(final_graph, text)
-        save_cache("stage6_verify", verification_result)
-        stages_completed += 1
-    except PipelineError as e:
-        logger.error(f"Stage 6 failed: {e}")
-        failed_stages.append("stage6")
-        verification_result = {}
+    if image_findings.get("thresholds") or image_findings.get("decision_rules"):
+        factors.setdefault("image_thresholds", []).extend(
+            image_findings.get("thresholds", [])
+        )
+        factors.setdefault("image_decision_rules", []).extend(
+            image_findings.get("decision_rules", [])
+        )
 
-    # ── Compute total tokens ───────────────────────────────────────────────────
+
+    # ── Stage 3 ───────────────────────────────────────────────────────────────
+    logger.info("Stage 3: Building algorithm structure...")
+    algorithm = _run("stage3", lambda: stages["3"].run(
+        osteosynthesis, arthroplasty, fracture_treatments, factors,
+        source_text=text,
+    )) or {"algorithm": {"branches": []}}
+    metrics["stage3_branches"] = len(algorithm.get("algorithm", {}).get("branches", []))
+
+    # ── Stage 4 ───────────────────────────────────────────────────────────────
+    logger.info("Stage 4: Generating graph JSON...")
+    raw_graph = _run("stage4", lambda: stages["4"].run(
+        algorithm, osteosynthesis, arthroplasty, fracture_treatments, factors,
+    ))
+    if raw_graph is None:
+        logger.error("Stage 4 failed — cannot continue")
+        sys.exit(1)
+    metrics["stage4_nodes"] = len(raw_graph.get("nodes", []))
+    metrics["stage4_edges"] = len(raw_graph.get("edges", []))
+
+    # Log fracture types that Stage 4 couldn't fit (likely hit output token limit)
+    stage4_missing = getattr(stages["4"], "missing_fracture_types", [])
+    if stage4_missing:
+        metrics["stage4_missing_fracture_types"] = stage4_missing
+        logger.warning(
+            f"Stage 4: graph is partial — {len(stage4_missing)} fracture type(s) "
+            f"will be completed by Stage 5b: {stage4_missing}"
+        )
+
+    # ── Branch coverage check (deterministic) ────────────────────────────────
+    if raw_graph and algorithm:
+        branches = algorithm.get("algorithm", {}).get("branches", [])
+        all_terminals = []
+        for b in branches:
+            all_terminals.extend(b.get("terminals", {}).values())
+        graph_action_labels = {
+            n["label"].lower() for n in raw_graph.get("nodes", [])
+            if n.get("type") == "ACTION"
+        }
+        missing_terminals = [
+            t for t in all_terminals
+            if not any(t.lower() in lbl or lbl in t.lower() for lbl in graph_action_labels)
+        ]
+        if missing_terminals:
+            logger.warning(
+                f"Branch coverage: {len(missing_terminals)} Stage-3 terminals "
+                f"not found in Stage-4 graph: {missing_terminals[:5]}"
+            )
+            metrics["missing_branch_terminals"] = missing_terminals
+        else:
+            logger.info("Branch coverage: all Stage-3 terminals present in graph ✓")
+            metrics["missing_branch_terminals"] = []
+
+    # ── Validate → Fix loop (Stage 5a ↔ Stage 5b) ───────────────────────────
+    MAX_FIX_ITERATIONS = args.max_fix_iterations
+    FIX_SCORE_THRESHOLD = 0.9   # stop early if completeness >= this AND 0 critical issues
+
+    current_graph  = raw_graph          # dict with nodes + edges (no metadata wrapper)
+    accumulated_changelog: list = []
+    validation:     dict = {}
+    metrics["fix_iterations"] = []
+
+    # If Stage 4 produced a complete graph (no missing fracture types and no
+    # structural issues), skip the validate→fix loop entirely to avoid
+    # Stage 5b accidentally degrading a correct graph.
+    stage4_complete = (
+        not stage4_missing
+        and len([
+            i for i in validate_graph_structure({"graph": raw_graph})
+            if i["severity"] == "critical"
+        ]) == 0
+    )
+    if stage4_complete:
+        logger.info(
+            "Stage 4 graph is complete and structurally valid — "
+            "skipping validate→fix loop."
+        )
+        metrics["fix_loop_skipped"] = True
+        metrics["fix_iterations"] = []
+        validation = {"completeness_score": None, "issues": [], "missing_scenarios": []}
+    else:
+        metrics["fix_loop_skipped"] = False
+        logger.info(
+            f"Starting validate→fix loop (max {MAX_FIX_ITERATIONS} iterations, "
+            f"threshold={FIX_SCORE_THRESHOLD})"
+        )
+
+    if not stage4_complete:
+      for iteration in range(1, MAX_FIX_ITERATIONS + 1):
+          iter_label = f"iter{iteration}"
+          logger.info(f"── Iteration {iteration}/{MAX_FIX_ITERATIONS} ──────────────────")
+
+          # ── 5a: Validate ──────────────────────────────────────────────────────
+          logger.info(f"  [5a] Validating graph (iteration {iteration})...")
+          validation = _run(
+              f"stage5a_{iter_label}",
+              lambda g=current_graph: stages["5a"].run(
+                  g, osteosynthesis, arthroplasty, fracture_treatments, text
+              ),
+          ) or {}
+
+          score       = validation.get("completeness_score", 0) or 0
+          crit_struct = validation.get("structural_critical", 0) or 0
+          crit_llm    = sum(
+              1 for i in validation.get("issues", [])
+              if i.get("severity") == "critical"
+          )
+          n_missing   = len(validation.get("missing_fracture_types", []))
+
+          iter_metrics = {
+              "iteration":          iteration,
+              "completeness_score": score,
+              "structural_critical": crit_struct,
+              "llm_critical_issues": crit_llm,
+              "missing_fracture_types": validation.get("missing_fracture_types", []),
+          }
+          metrics["fix_iterations"].append(iter_metrics)
+
+          logger.info(
+              f"  [5a] score={score:.2f}  struct_crit={crit_struct}  "
+              f"llm_crit={crit_llm}  missing={n_missing}"
+          )
+
+          # ── Early exit: graph is good enough ─────────────────────────────────
+          if score >= FIX_SCORE_THRESHOLD and crit_struct == 0 and crit_llm == 0:
+              logger.info(
+                  f"  ✅ Graph satisfactory after iteration {iteration} — "
+                  f"stopping loop"
+              )
+              break
+
+          # ── Early exit: last iteration reached ───────────────────────────────
+          if iteration == MAX_FIX_ITERATIONS:
+              logger.warning(
+                  f"   Max iterations reached ({MAX_FIX_ITERATIONS}) — "
+                  f"using best graph so far (score={score:.2f})"
+              )
+              break
+
+          # ── 5b: Fix ───────────────────────────────────────────────────────────
+          logger.info(f"  [5b] Fixing graph (iteration {iteration})...")
+
+          # On first iteration, if Stage 4 produced a partial graph,
+          # inject the known missing types into validation so 5b's prompt is explicit.
+          validation_for_fix = validation
+          if iteration == 1 and stage4_missing:
+              import copy
+              validation_for_fix = copy.deepcopy(validation)
+              existing_missing = validation_for_fix.get("missing_fracture_types", [])
+              merged_missing = list(dict.fromkeys(existing_missing + stage4_missing))
+              validation_for_fix["missing_fracture_types"] = merged_missing
+              # Also add as high-importance missing_scenarios so _format_issues includes them
+              existing_scenarios = validation_for_fix.get("missing_scenarios", [])
+              known_ids = {s.get("fracture_type", "") for s in existing_scenarios}
+              for ft in stage4_missing:
+                  if ft not in known_ids:
+                      existing_scenarios.append({
+                          "fracture_type": ft,
+                          "patient_params": {},
+                          "expected_action": "см. алгоритм Stage 3",
+                          "importance": "high",
+                      })
+              validation_for_fix["missing_scenarios"] = existing_scenarios
+              logger.info(
+                  f"  [5b] Injected {len(stage4_missing)} Stage-4-missing types "
+                  f"into validation for fix prompt."
+              )
+
+          fixed = _run(
+              f"stage5b_{iter_label}",
+              lambda g=current_graph, v=validation_for_fix: stages["5b"].run(
+                  g, v, text, algorithm=algorithm
+              ),
+          )
+
+          if fixed is None:
+              logger.error(f"  [5b] Fix failed at iteration {iteration} — keeping previous graph")
+              break
+
+          # Accumulate changelog from this fix iteration
+          iter_changelog = fixed.get("changelog", [])
+          for entry in iter_changelog:
+              entry.setdefault("fix_iteration", iteration)
+          accumulated_changelog.extend(iter_changelog)
+
+          # Update current graph for next iteration
+          current_graph = {
+              "nodes":     fixed.get("nodes", current_graph.get("nodes", [])),
+              "edges":     fixed.get("edges", current_graph.get("edges", [])),
+              "changelog": accumulated_changelog,
+          }
+
+          n_nodes = len(current_graph["nodes"])
+          n_edges = len(current_graph["edges"])
+          n_act   = sum(1 for n in current_graph["nodes"] if n.get("type") == "ACTION")
+          logger.info(
+              f"  [5b] Graph updated: {n_nodes} nodes ({n_act} actions), "
+              f"{n_edges} edges, {len(iter_changelog)} changelog entries"
+          )
+
+    fixed_data = current_graph
+    # Preserve full accumulated changelog
+    if accumulated_changelog:
+        fixed_data["changelog"] = accumulated_changelog
+
+    # Summary metrics
+    metrics["stage5a_completeness"] = validation.get("completeness_score")
+    metrics["stage5a_missing"]      = validation.get("missing_fracture_types", [])
+    metrics["stage5b_skipped"]      = len(metrics["fix_iterations"]) == 1 and (
+        metrics["fix_iterations"][0]["completeness_score"] >= FIX_SCORE_THRESHOLD
+        and metrics["fix_iterations"][0]["structural_critical"] == 0
+    )
+    metrics["total_fix_iterations"] = len(metrics["fix_iterations"])
+
+    # ── Final structural validation ───────────────────────────────────────────
+    final_graph_doc = assemble_output(fixed_data, args.input, args.topic,
+                                      fixed_data.get("changelog", []))
+    structural_issues = validate_graph_structure(final_graph_doc)
+    metrics["final_structural_critical"] = sum(
+        1 for i in structural_issues if i["severity"] == "critical"
+    )
+    metrics["final_structural_warnings"] = sum(
+        1 for i in structural_issues if i["severity"] == "warning"
+    )
+    metrics["final_structural_issues"] = structural_issues
+    for iss in structural_issues:
+        level = logging.WARNING if iss["severity"] == "critical" else logging.INFO
+        logger.log(level, f"Final validation [{iss['severity'].upper()}]: {iss['description']}")
+
+    # ── Token accounting ──────────────────────────────────────────────────────
     total_tokens = sum(s.tokens_used for s in stages.values())
+    metrics["total_tokens_used"] = total_tokens
+    metrics["finished_at"] = datetime.now(timezone.utc).isoformat()
+    metrics["failed_stages"] = failed_stages
+    metrics["stages_completed"] = stages_completed
 
-    # ── Compute metrics ────────────────────────────────────────────────────────
-    rules_extracted = len(rules.get("rules", []))
-    rules_mapped = len(final_graph["graph"]["nodes"])  # approximation
-
-    metrics = compute_graph_metrics(
-        graph=final_graph,
-        entities_count=len(entities.get("entities", [])),
-        rules_count=rules_extracted,
-        rules_mapped=rules_mapped,
-        stages_completed=stages_completed,
-        total_tokens=total_tokens,
-        failed_stages=failed_stages,
-    )
-
-    # Add verification scores to metrics
-    if verification_result:
-        metrics["clinical_accuracy_score"] = verification_result.get("clinical_accuracy_score")
-        metrics["clinical_issues"] = verification_result.get("issues", [])
-        metrics["missing_scenarios"] = verification_result.get("missing_scenarios", [])
-
-    # Add timing
-    metrics["elapsed_seconds"] = round(time.time() - start_time, 1)
-
-    # ── Save outputs ───────────────────────────────────────────────────────────
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    output_path = args.output
+    metrics_path = args.metrics
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(
-        json.dumps(final_graph, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(final_graph_doc, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
     Path(metrics_path).write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     logger.info(f"Saved graph → {output_path}")
     logger.info(f"Saved metrics → {metrics_path}")
 
-    # ── Print report ───────────────────────────────────────────────────────────
-    source_name = Path(input_pdf).name
-    if HAS_RICH:
-        _print_rich(metrics, verification_result, output_path, metrics_path, 6, failed_stages, source_name)
-    else:
-        _print_plain(metrics, verification_result, output_path, metrics_path, 6, failed_stages)
-
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Extract clinical decision graphs from PDF guidelines using LLM cascade",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    print_report(
+        output_path, metrics_path,
+        stages_completed, failed_stages,
+        final_graph_doc, validation, structural_issues,
     )
-    parser.add_argument("--input", "-i", required=True, help="Input PDF file path")
-    parser.add_argument("--output", "-o", default="graph.json", help="Output JSON file (default: graph.json)")
-    parser.add_argument("--metrics", "-m", default="metrics.json", help="Metrics JSON file (default: metrics.json)")
-    parser.add_argument("--section", "-s", default=None, help="Optional: focus on this section of the document")
-    parser.add_argument(
-        "--model",
-        default="claude-sonnet-4-20250514",
-        help="Claude model to use (default: claude-sonnet-4-20250514)"
-    )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    parser.add_argument(
-        "--use-cache",
-        action="store_true",
-        help="Load intermediate results from pipeline_cache/ if available"
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    setup_logging(args.verbose)
-
-    if not Path(args.input).exists():
-        print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        run_pipeline(
-            input_pdf=args.input,
-            output_path=args.output,
-            metrics_path=args.metrics,
-            section=args.section,
-            model=args.model,
-            verbose=args.verbose,
-            use_cache=args.use_cache,
-        )
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
